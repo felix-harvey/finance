@@ -70,16 +70,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             handleCreateProposal($db, $user_id);
         } elseif (isset($_POST['update_proposal'])) {
             handleUpdateProposal($db, $user_id);
-        } elseif (isset($_POST['submit_for_approval'])) {
-            handleSubmitForApproval($db, $user_id);
-        } elseif (isset($_POST['add_budget_item'])) {
-            handleAddBudgetItem($db, $user_id);
-        } elseif (isset($_POST['delete_budget_item'])) {
-            handleDeleteBudgetItem($db, $user_id);
         } elseif (isset($_POST['delete_proposal'])) {
             handleDeleteProposal($db, $user_id);
-        } elseif (isset($_POST['revise_proposal'])) {
-            handleReviseProposal($db, $user_id);
         }
     } catch (Exception $e) {
         error_log("Budget proposal error: " . $e->getMessage());
@@ -151,7 +143,7 @@ function getNotifications(PDO $db, int $user_id): array {
 }
 
 function handleCreateProposal(PDO $db, $user_id): void {
-    $required = ['title', 'department', 'fiscal_year'];
+    $required = ['title', 'department', 'fiscal_year', 'total_amount'];
     foreach ($required as $field) {
         if (empty($_POST[$field])) {
             throw new Exception("Missing required field: $field");
@@ -161,47 +153,136 @@ function handleCreateProposal(PDO $db, $user_id): void {
     $title = trim($_POST['title']);
     $department = (int)$_POST['department'];
     $fiscal_year = trim($_POST['fiscal_year']);
+    $total_amount = (float)$_POST['total_amount'];
     $description = trim($_POST['description'] ?? '');
     
     if (empty($title)) {
         throw new Exception("Proposal title is required");
     }
     
-    $stmt = $db->prepare("
-        INSERT INTO budget_proposals 
-        (title, department, fiscal_year, submitted_by, status, description) 
-        VALUES (?, ?, ?, ?, 'Draft', ?)
-    ");
-    $stmt->execute([$title, $department, $fiscal_year, $user_id, $description]);
-    $proposal_id = $db->lastInsertId();
-    
-    // Handle budget items if provided during creation
-    if (isset($_POST['budget_items']) && is_array($_POST['budget_items'])) {
-        foreach ($_POST['budget_items'] as $item) {
-            if (!empty($item['description']) && $item['quantity'] > 0 && $item['unit_cost'] >= 0) {
-                $category = (int)$item['category'];
-                $item_description = trim($item['description']);
-                $quantity = (int)$item['quantity'];
-                $unit_cost = (float)$item['unit_cost'];
-                $justification = trim($item['justification'] ?? '');
-                $total_cost = $quantity * $unit_cost;
-
-                $insert_stmt = $db->prepare("
-                    INSERT INTO budget_items 
-                    (proposal_id, category, description, quantity, unit_cost, total_cost, justification) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ");
-                $insert_stmt->execute([
-                    $proposal_id, $category, $item_description, $quantity, 
-                    $unit_cost, $total_cost, $justification
-                ]);
-            }
-        }
+    if ($total_amount <= 0) {
+        throw new Exception("Total amount must be greater than 0");
     }
     
-    $_SESSION['success_message'] = "Budget proposal created successfully!";
+    // Start transaction
+    $db->beginTransaction();
     
-    // Redirect to main page instead of edit page
+    try {
+        // Insert budget proposal with status 'Approved' (auto-allocated)
+        $stmt = $db->prepare("
+            INSERT INTO budget_proposals 
+            (title, department, fiscal_year, submitted_by, status, description, total_amount) 
+            VALUES (?, ?, ?, ?, 'Approved', ?, ?)
+        ");
+        $stmt->execute([$title, $department, $fiscal_year, $user_id, $description, $total_amount]);
+        $proposal_id = $db->lastInsertId();
+        
+        // Find or create a customer/AR contact for the department
+        $dept_stmt = $db->prepare("SELECT name FROM departments WHERE id = ?");
+        $dept_stmt->execute([$department]);
+        $department_data = $dept_stmt->fetch();
+        
+        $contact_name = $department_data['name'] . " Budget - " . $title;
+        
+        // Check if contact exists
+        $contact_stmt = $db->prepare("SELECT id FROM business_contacts WHERE name = ? AND type = 'Customer' AND contact_person = 'System Generated'");
+        $contact_stmt->execute([$contact_name]);
+        $contact = $contact_stmt->fetch();
+        
+        $contact_id = null;
+        if ($contact) {
+            $contact_id = $contact['id'];
+        } else {
+            // Generate unique contact ID
+            $prefix = 'AR-BUDGET-';
+            
+            // Get the highest existing number for system-generated budget contacts
+            $sql = "SELECT MAX(CAST(SUBSTRING(contact_id, 11) AS UNSIGNED)) as max_num 
+                    FROM business_contacts 
+                    WHERE type = 'Customer' 
+                    AND contact_person = 'System Generated'
+                    AND contact_id LIKE ?";
+            $stmt = $db->prepare($sql);
+            $stmt->execute([$prefix . '%']);
+            $result = $stmt->fetch();
+            
+            $next_num = ($result['max_num'] ?? 0) + 1;
+            $contact_id_str = $prefix . str_pad((string)$next_num, 3, '0', STR_PAD_LEFT);
+            
+            // Check if contact ID already exists
+            $check_sql = "SELECT COUNT(*) as count FROM business_contacts WHERE contact_id = ?";
+            $check_stmt = $db->prepare($check_sql);
+            $check_stmt->execute([$contact_id_str]);
+            $exists = $check_stmt->fetch()['count'];
+            
+            // If exists, find next available number
+            while ($exists > 0) {
+                $next_num++;
+                $contact_id_str = $prefix . str_pad((string)$next_num, 3, '0', STR_PAD_LEFT);
+                $check_stmt->execute([$contact_id_str]);
+                $exists = $check_stmt->fetch()['count'];
+            }
+            
+            // Create new budget AR contact
+            $insert_contact = $db->prepare("
+                INSERT INTO business_contacts 
+                (contact_id, name, contact_person, email, phone, type, status, is_budget_contact) 
+                VALUES (?, ?, 'System Generated', 'budget@company.com', 'N/A', 'Customer', 'Active', 1)
+            ");
+            $insert_contact->execute([$contact_id_str, $contact_name]);
+            $contact_id = $db->lastInsertId();
+        }
+        
+        // Create an invoice for the budget allocation (Receivable type)
+        $invoice_ref = 'BUDGET-' . str_pad($proposal_id, 4, '0', STR_PAD_LEFT);
+        $invoice_stmt = $db->prepare("
+            INSERT INTO invoices 
+            (invoice_number, contact_id, type, amount, description, status, issue_date, due_date, created_at, is_budget_allocation) 
+            VALUES (?, ?, 'Receivable', ?, ?, 'Paid', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), 1)
+        ");
+        $invoice_stmt->execute([
+            $invoice_ref,
+            $contact_id,
+            $total_amount,
+            'Budget Allocation: ' . $title . ' (FY: ' . $fiscal_year . ')'
+        ]);
+        $invoice_id = $db->lastInsertId();
+
+        // Create a payment record for the invoice to mark it as paid
+        $payment_id = 'BUDGET-PAY-' . date('YmdHis') . rand(100, 999);
+        
+        $payment_stmt = $db->prepare("
+            INSERT INTO payments 
+            (payment_id, contact_id, invoice_id, type, amount, status, payment_date, description) 
+            VALUES (?, ?, ?, 'Receive', ?, 'Completed', NOW(), 'Budget Allocation Payment')
+        ");
+        $payment_stmt->execute([
+            $payment_id,
+            $contact_id,
+            $invoice_id,
+            $total_amount
+        ]);
+
+        // Update the budget proposal with the AR contact ID for reference
+        $update_proposal = $db->prepare("
+            UPDATE budget_proposals 
+            SET ar_contact_id = ? 
+            WHERE id = ?
+        ");
+        $update_proposal->execute([$contact_id, $proposal_id]);
+
+        // Commit transaction
+        $db->commit();
+        
+        $_SESSION['success_message'] = "Budget allocation created and ₱" . number_format($total_amount, 2) . " allocated to Accounts Receivable!";
+        
+    } catch (Exception $e) {
+        // Rollback transaction on error
+        $db->rollBack();
+        throw new Exception("Failed to create budget allocation: " . $e->getMessage());
+    }
+    
+    // Redirect to main page
     header("Location: budget_proposal.php");
     exit;
 }
@@ -222,131 +303,7 @@ function handleUpdateProposal(PDO $db, $user_id): void {
     ");
     $stmt->execute([$title, $description, $proposal_id, $user_id]);
     
-    $_SESSION['success_message'] = "Budget proposal updated successfully!";
-    header("Location: budget_proposal.php");
-    exit;
-}
-
-function handleReviseProposal(PDO $db, $user_id): void {
-    if (empty($_POST['proposal_id'])) {
-        throw new Exception("Proposal ID is required");
-    }
-    
-    $proposal_id = (int)$_POST['proposal_id'];
-    
-    // Verify the proposal belongs to the user and is in Rejected status
-    $verify_stmt = $db->prepare("SELECT id FROM budget_proposals WHERE id = ? AND submitted_by = ? AND status = 'Rejected'");
-    $verify_stmt->execute([$proposal_id, $user_id]);
-    $proposal = $verify_stmt->fetch();
-    
-    if (!$proposal) {
-        throw new Exception("Proposal not found, not rejected, or you don't have permission to revise it");
-    }
-    
-    // Update proposal status back to Draft
-    $stmt = $db->prepare("
-        UPDATE budget_proposals 
-        SET status = 'Draft', updated_at = NOW()
-        WHERE id = ? AND submitted_by = ?
-    ");
-    $stmt->execute([$proposal_id, $user_id]);
-    
-    $_SESSION['success_message'] = "Proposal revised successfully! You can now edit it.";
-    header("Location: budget_proposal.php");
-    exit;
-}
-
-function handleSubmitForApproval(PDO $db, $user_id): void {
-    if (empty($_POST['proposal_id'])) {
-        throw new Exception("Proposal ID is required");
-    }
-    
-    $proposal_id = (int)$_POST['proposal_id'];
-    
-    // Check if proposal has budget items
-    $check_items = $db->prepare("SELECT COUNT(*) as item_count FROM budget_items WHERE proposal_id = ?");
-    $check_items->execute([$proposal_id]);
-    $item_count = $check_items->fetch()['item_count'];
-    
-    if ($item_count === 0) {
-        throw new Exception("Cannot submit proposal without budget items.");
-    }
-    
-    // Verify the proposal belongs to the user and is in Draft status
-    $verify_stmt = $db->prepare("SELECT id, department, title FROM budget_proposals WHERE id = ? AND submitted_by = ? AND status = 'Draft'");
-    $verify_stmt->execute([$proposal_id, $user_id]);
-    $proposal = $verify_stmt->fetch();
-    
-    if (!$proposal) {
-        throw new Exception("Proposal not found or you don't have permission to submit it");
-    }
-    
-    // Update proposal status
-    $stmt = $db->prepare("
-        UPDATE budget_proposals 
-        SET status = 'Submitted', submitted_date = NOW(), updated_at = NOW()
-        WHERE id = ? AND submitted_by = ?
-    ");
-    $stmt->execute([$proposal_id, $user_id]);
-    
-    if ($stmt->rowCount() === 0) {
-        throw new Exception("Failed to submit proposal.");
-    }
-    
-    $_SESSION['success_message'] = "Budget proposal submitted for approval!";
-    header("Location: budget_proposal.php");
-    exit;
-}
-
-function handleAddBudgetItem(PDO $db, $user_id): void {
-    if (empty($_POST['proposal_id'])) {
-        throw new Exception("Proposal ID is required");
-    }
-    
-    $proposal_id = (int)$_POST['proposal_id'];
-    $category = (int)$_POST['category'];
-    $item_description = trim($_POST['item_description'] ?? '');
-    $quantity = (int)($_POST['quantity'] ?? 1);
-    $unit_cost = (float)($_POST['unit_cost'] ?? 0);
-    $justification = trim($_POST['justification'] ?? '');
-    
-    if (empty($item_description)) {
-        throw new Exception("Item description is required");
-    }
-
-    if ($quantity <= 0) {
-        throw new Exception("Quantity must be greater than 0");
-    }
-
-    if ($unit_cost < 0) {
-        throw new Exception("Unit cost cannot be negative");
-    }
-
-    $total_cost = $quantity * $unit_cost;
-
-    $insert_stmt = $db->prepare("
-        INSERT INTO budget_items 
-        (proposal_id, category, description, quantity, unit_cost, total_cost, justification) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ");
-    $insert_stmt->execute([
-        $proposal_id, $category, $item_description, $quantity, 
-        $unit_cost, $total_cost, $justification
-    ]);
-    
-    $_SESSION['success_message'] = "Budget item added successfully!";
-    header("Location: budget_proposal.php");
-    exit;
-}
-
-function handleDeleteBudgetItem(PDO $db, $user_id): void {
-    $item_id = (int)$_POST['item_id'];
-    $proposal_id = (int)$_POST['proposal_id'];
-    
-    $delete_stmt = $db->prepare("DELETE FROM budget_items WHERE id = ? AND proposal_id = ?");
-    $delete_stmt->execute([$item_id, $proposal_id]);
-    
-    $_SESSION['success_message'] = "Budget item deleted successfully!";
+    $_SESSION['success_message'] = "Budget allocation updated successfully!";
     header("Location: budget_proposal.php");
     exit;
 }
@@ -359,7 +316,7 @@ function handleDeleteProposal(PDO $db, $user_id): void {
     $proposal_id = (int)$_POST['proposal_id'];
     
     // Verify the proposal belongs to the user
-    $verify_stmt = $db->prepare("SELECT id FROM budget_proposals WHERE id = ? AND submitted_by = ?");
+    $verify_stmt = $db->prepare("SELECT id, ar_contact_id FROM budget_proposals WHERE id = ? AND submitted_by = ?");
     $verify_stmt->execute([$proposal_id, $user_id]);
     $proposal = $verify_stmt->fetch();
     
@@ -367,32 +324,66 @@ function handleDeleteProposal(PDO $db, $user_id): void {
         throw new Exception("Proposal not found or you don't have permission to delete it");
     }
     
-    // Delete budget items first
-    $delete_items = $db->prepare("DELETE FROM budget_items WHERE proposal_id = ?");
-    $delete_items->execute([$proposal_id]);
+    // Start transaction
+    $db->beginTransaction();
     
-    // Delete the proposal
-    $delete_stmt = $db->prepare("DELETE FROM budget_proposals WHERE id = ? AND submitted_by = ?");
-    $delete_stmt->execute([$proposal_id, $user_id]);
+    try {
+        $contact_id = $proposal['ar_contact_id'];
+        
+        if ($contact_id) {
+            // Delete related payments
+            $delete_payments = $db->prepare("DELETE FROM payments WHERE contact_id = ? AND description LIKE '%Budget%'");
+            $delete_payments->execute([$contact_id]);
+            
+            // Delete related invoices
+            $delete_invoices = $db->prepare("DELETE FROM invoices WHERE contact_id = ? AND is_budget_allocation = 1");
+            $delete_invoices->execute([$contact_id]);
+            
+            // Delete the budget contact if it has no other invoices
+            $check_invoices = $db->prepare("SELECT COUNT(*) as invoice_count FROM invoices WHERE contact_id = ?");
+            $check_invoices->execute([$contact_id]);
+            $invoice_count = $check_invoices->fetch()['invoice_count'];
+            
+            if ($invoice_count === 0) {
+                $delete_contact = $db->prepare("DELETE FROM business_contacts WHERE id = ? AND is_budget_contact = 1");
+                $delete_contact->execute([$contact_id]);
+            }
+        }
+        
+        // Delete the proposal
+        $delete_stmt = $db->prepare("DELETE FROM budget_proposals WHERE id = ? AND submitted_by = ?");
+        $delete_stmt->execute([$proposal_id, $user_id]);
+        
+        // Commit transaction
+        $db->commit();
+        
+        $_SESSION['success_message'] = "Budget allocation deleted successfully!";
+        
+    } catch (Exception $e) {
+        // Rollback transaction on error
+        $db->rollBack();
+        throw new Exception("Failed to delete allocation: " . $e->getMessage());
+    }
     
-    $_SESSION['success_message'] = "Budget proposal deleted successfully!";
     header("Location: budget_proposal.php");
     exit;
 }
 
 function loadData(PDO $db, $user_id, &$budget_proposals, &$departments, &$fiscal_years, &$categories): void {
     try {
-        // Get budget proposals
+        // Get budget proposals - show all approved (allocated) budgets
         $proposal_stmt = $db->prepare("
             SELECT bp.*, u.name as submitter_name, 
                    d.name as department_name,
-                   COUNT(bi.id) as item_count,
-                   COALESCE(SUM(bi.total_cost), 0) as calculated_total
+                   bp.total_amount as calculated_total,
+                   bc.contact_id as ar_contact_id,
+                   0 as item_count
             FROM budget_proposals bp
             LEFT JOIN users u ON bp.submitted_by = u.id
             LEFT JOIN departments d ON bp.department = d.id
-            LEFT JOIN budget_items bi ON bp.id = bi.proposal_id
+            LEFT JOIN business_contacts bc ON bp.ar_contact_id = bc.id
             WHERE bp.submitted_by = ?
+            AND bp.status = 'Approved'  -- Show approved budgets (allocated)
             GROUP BY bp.id
             ORDER BY bp.created_at DESC
         ");
@@ -410,7 +401,7 @@ function loadData(PDO $db, $user_id, &$budget_proposals, &$departments, &$fiscal
             $fiscal_years = [['fiscal_year' => date('Y')]];
         }
 
-        // Get budget categories
+        // Get budget categories (keeping for future use if needed)
         $cat_stmt = $db->query("SELECT id, name, type FROM budget_categories WHERE status = 'Active' ORDER BY type, name");
         $categories = $cat_stmt->fetchAll();
 
@@ -506,26 +497,10 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
             font-size: 0.75rem;
             border-radius: 9999px;
         }
-        .status-draft {
-            background-color: rgba(156, 163, 175, 0.1);
-            color: #6B7280;
-        }
-        .status-submitted {
-            background-color: rgba(59, 130, 246, 0.1);
-            color: #3B82F6;
-        }
         .status-approved {
-            background-color: rgba(34, 197, 94, 0.1);
-            color: #16A34A;
-        }
-        .status-rejected {
-            background-color: rgba(239, 68, 68, 0.1);
-            color: #DC2626;
-        }
-        .status-under-review {
-            background-color: rgba(245, 158, 11, 0.1);
-            color: #D97706;
-        }
+    background-color: rgba(34, 197, 94, 0.1);
+    color: #16A34A;
+}
         #sidebar {
             transition: transform 0.3s ease-in-out;
             background-color: #2f855A;
@@ -1021,51 +996,48 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
     <div id="create-proposal-modal" class="modal">
         <div class="modal-content">
             <span class="close-modal">&times;</span>
-            <h2 class="text-xl font-bold mb-4">Create New Budget Proposal</h2>
+            <h2 class="text-xl font-bold mb-4">Create New Budget Allocation</h2>
             <form method="POST" id="create-proposal-form">
                 <div class="form-group">
-                    <label class="form-label">Proposal Title*</label>
+                    <label class="form-label">Budget Title*</label>
                     <input type="text" name="title" class="form-input" required 
                            placeholder="e.g., Q3 Marketing Campaign Budget">
                 </div>
-                <div class="form-group">
-                    <label class="form-label">Department*</label>
-                    <select name="department" class="form-select" required>
-                        <option value="">Select Department</option>
-                        <?php foreach ($departments as $dept): ?>
-                            <option value="<?= safe_output($dept['id']) ?>"><?= safe_output($dept['name']) ?></option>
-                        <?php endforeach; ?>
-                    </select>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-group">
+                        <label class="form-label">Department*</label>
+                        <select name="department" class="form-select" required>
+                            <option value="">Select Department</option>
+                            <?php foreach ($departments as $dept): ?>
+                                <option value="<?= safe_output($dept['id']) ?>"><?= safe_output($dept['name']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Fiscal Year*</label>
+                        <select name="fiscal_year" class="form-select" required>
+                            <option value="">Select Fiscal Year</option>
+                            <?php foreach ($fiscal_years as $year): ?>
+                                <option value="<?= safe_output($year['fiscal_year']) ?>"><?= safe_output($year['fiscal_year']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Fiscal Year*</label>
-                    <select name="fiscal_year" class="form-select" required>
-                        <option value="">Select Fiscal Year</option>
-                        <?php foreach ($fiscal_years as $year): ?>
-                            <option value="<?= safe_output($year['fiscal_year']) ?>"><?= safe_output($year['fiscal_year']) ?></option>
-                        <?php endforeach; ?>
-                    </select>
+                    <label class="form-label">Total Amount (₱)*</label>
+                    <input type="number" name="total_amount" class="form-input" step="0.01" min="0.01" required 
+                           placeholder="0.00">
+                    <p class="text-sm text-gray-500 mt-1">This amount will be automatically allocated to Accounts Receivable</p>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Description</label>
                     <textarea name="description" class="form-textarea" rows="3" 
-                              placeholder="Enter detailed proposal description (optional)"></textarea>
-                </div>
-                
-                <!-- Budget Items Section -->
-                <div class="mt-6">
-                    <h3 class="text-lg font-semibold mb-4">Budget Items</h3>
-                    <div id="budget-items-container">
-                        <!-- Budget items will be added here dynamically -->
-                    </div>
-                    <button type="button" id="add-budget-item-btn" class="btn btn-secondary mb-4">
-                        <i class="fas fa-plus mr-2"></i>Add Budget Item
-                    </button>
+                              placeholder="Enter detailed budget description (optional)"></textarea>
                 </div>
                 
                 <div class="flex space-x-2 mt-6">
                     <button type="button" class="btn btn-secondary flex-1" onclick="closeModal('create-proposal-modal')">Cancel</button>
-                    <button type="submit" name="create_proposal" class="btn btn-primary flex-1">Create Proposal</button>
+                    <button type="submit" name="create_proposal" class="btn btn-primary flex-1">Allocate Budget</button>
                 </div>
             </form>
         </div>
@@ -1108,7 +1080,7 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                             <span class="text-sm font-medium text-white">FINANCIAL</span>
                         </a>
                      
-			<!-- Disbursement Section -->
+                        <!-- Disbursement Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="disbursement">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Disbursement</h3>
@@ -1173,7 +1145,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                             </div>
                             <div class="submenu mt-1 active" id="budget-submenu">
                                 <a href="budget_proposal.php" class="submenu-item active transition-colors duration-200">Budget Proposal</a>
-                                <a href="approval_workflow.php" class="submenu-item transition-colors duration-200">Approval Workflow</a>
                                 <a href="budget_vs_actual.php" class="submenu-item transition-colors duration-200">Budget vs Actual</a>
                                 <a href="budget_reports.php" class="submenu-item transition-colors duration-200">Budget Reports</a>
                             </div>
@@ -1199,8 +1170,8 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                         <div class="hamburger-line"></div>
                     </button>
                     <div>
-                        <h1 class="text-2xl font-bold text-white">Budget Proposal Management</h1>
-                        <p class="text-sm text-white/90">Create, manage, and track budget proposals</p>
+                        <h1 class="text-2xl font-bold text-white">Budget Allocation Management</h1>
+                        <p class="text-sm text-white/90">Create and manage budget allocations (automatically added to AR)</p>
                     </div>
                 </div>
                 <div class="flex items-center space-x-3">
@@ -1241,34 +1212,33 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                 <?php endif; ?>
 
                 <!-- Quick Stats -->
-                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                     <div class="stat-card">
                         <div class="stat-value text-primary-green"><?= count($budget_proposals) ?></div>
-                        <div class="stat-label">Total Proposals</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value text-blue-600">
-                            <?= count(array_filter($budget_proposals, fn($p) => $p['status'] === 'Draft')) ?>
-                        </div>
-                        <div class="stat-label">Draft Proposals</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value text-orange-600">
-                            <?= count(array_filter($budget_proposals, fn($p) => $p['status'] === 'Submitted')) ?>
-                        </div>
-                        <div class="stat-label">Submitted</div>
+                        <div class="stat-label">Total Allocations</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value text-green-600">
-                            <?= count(array_filter($budget_proposals, fn($p) => $p['status'] === 'Approved')) ?>
+                            ₱<?php 
+                                $total_allocated = array_sum(array_column($budget_proposals, 'calculated_total'));
+                                echo $_SESSION['hide_numbers'] ? '***' : number_format($total_allocated, 2);
+                            ?>
                         </div>
-                        <div class="stat-label">Approved</div>
+                        <div class="stat-label">Total Allocated</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value text-blue-600">
+                            <a href="vendors_customers.php#customers-tab" class="hover:underline">
+                                View in AR
+                            </a>
+                        </div>
+                        <div class="stat-label">Budget Allocations</div>
                     </div>
                 </div>
 
                 <!-- Action Buttons -->
                 <div class="flex justify-between items-center mb-6">
-                    <h2 class="text-xl font-bold">Budget Proposals</h2>
+                    <h2 class="text-xl font-bold">Budget Allocations</h2>
                     <div class="flex space-x-2">
                         <button class="btn btn-secondary" onclick="printProposals()">
                             <i class="fa-solid fa-print mr-2"></i>Print
@@ -1277,7 +1247,7 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                             <i class="fa-solid fa-file-excel mr-2"></i>Export
                         </button>
                         <button class="btn btn-primary" onclick="openModal('create-proposal-modal')">
-                            <i class="fa-solid fa-plus mr-2"></i>New Proposal
+                            <i class="fa-solid fa-plus mr-2"></i>New Allocation
                         </button>
                     </div>
                 </div>
@@ -1292,8 +1262,8 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                                     <th>Department</th>
                                     <th>Fiscal Year</th>
                                     <th>Status</th>
-                                    <th>Total Amount</th>
-                                    <th>Items</th>
+                                    <th>Allocated Amount</th>
+                                    <th>AR Contact ID</th>
                                     <th>Created Date</th>
                                     <th>Actions</th>
                                 </tr>
@@ -1302,14 +1272,14 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                                 <?php if (empty($budget_proposals)): ?>
                                     <tr>
                                         <td colspan="8" class="text-center py-4 text-gray-500">
-                                            No budget proposals found. <button class="text-primary-green hover:underline" onclick="openModal('create-proposal-modal')">Create your first proposal</button>
+                                            No budget allocations found. <button class="text-primary-green hover:underline" onclick="openModal('create-proposal-modal')">Create your first budget allocation</button>
                                         </td>
                                     </tr>
                                 <?php else: ?>
                                     <?php foreach ($budget_proposals as $proposal): ?>
                                         <tr class="budget-item-row">
                                             <td>
-                                                <div class="font-semibold"><?= safe_output($proposal['title'] ?? 'Untitled Proposal') ?></div>
+                                                <div class="font-semibold"><?= safe_output($proposal['title'] ?? 'Untitled Budget') ?></div>
                                                 <?php if (!empty($proposal['description'])): ?>
                                                     <div class="text-sm text-gray-500"><?= safe_output(substr($proposal['description'], 0, 50)) . (strlen($proposal['description']) > 50 ? '...' : '') ?></div>
                                                 <?php endif; ?>
@@ -1317,47 +1287,58 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                                             <td><?= safe_output($proposal['department_name'] ?? $proposal['department']) ?></td>
                                             <td><?= safe_output($proposal['fiscal_year']) ?></td>
                                             <td>
-                                                <span class="status-badge status-<?= strtolower($proposal['status']) ?>">
-                                                    <?= safe_output($proposal['status']) ?>
-                                                </span>
+                                                <span class="status-badge status-approved">
+    Allocated
+</span>
                                             </td>
                                             <td class="font-semibold <?= $_SESSION['hide_numbers'] ? 'amount-masked' : '' ?>">
                                                 <?php 
                                                 $calculated_total = (float)($proposal['calculated_total'] ?? 0);
-                                                echo $calculated_total > 0 ? format_amount($calculated_total) : '<span class="text-gray-400 text-sm">No items yet</span>';
+                                                echo $calculated_total > 0 ? format_amount($calculated_total) : '<span class="text-gray-400 text-sm">No amount set</span>';
                                                 ?>
                                             </td>
-                                            <td><?= $proposal['item_count'] ?></td>
+                                            <td>
+                                                <?php if (!empty($proposal['ar_contact_id'])): ?>
+                                                    <span class="font-mono text-sm bg-blue-50 px-2 py-1 rounded"><?= safe_output($proposal['ar_contact_id']) ?></span>
+                                                <?php else: ?>
+                                                    <span class="text-gray-400 text-sm">AR-Contact</span>
+                                                <?php endif; ?>
+                                            </td>
                                             <td><?= date('M j, Y', strtotime($proposal['created_at'])) ?></td>
                                             <td class="space-x-1">
-    <?php if ($proposal['status'] === 'Draft'): ?>
-        <?php if ($proposal['item_count'] > 0): ?>
-            <form method="POST" class="inline">
-                <input type="hidden" name="proposal_id" value="<?= $proposal['id'] ?>">
-                <button type="submit" name="submit_for_approval" class="action-btn success" 
-                        onclick="return confirm('Submit this proposal for approval?')">
-                    <i class="fa-solid fa-paper-plane mr-1"></i>Submit
-                </button>
-            </form>
-        <?php endif; ?>
-    <?php elseif ($proposal['status'] === 'Rejected'): ?>
-        <button class="action-btn warning" onclick="openEditModal(<?= $proposal['id'] ?>)">
-            <i class="fa-solid fa-edit mr-1"></i>Revise
-        </button>
-        <a href="approval_workflow.php?proposal_id=<?= $proposal['id'] ?>" class="action-btn view">
-            <i class="fa-solid fa-eye mr-1"></i>View
-        </a>
-    <?php else: ?>
-        <a href="approval_workflow.php?proposal_id=<?= $proposal['id'] ?>" class="action-btn view">
-            <i class="fa-solid fa-eye mr-1"></i>View
-        </a>
-    <?php endif; ?>
-</td>
+                                                <button class="action-btn view" onclick="window.location.href='vendors_customers.php#customers-tab'">
+                                                    <i class="fa-solid fa-eye mr-1"></i>View in AR
+                                                </button>
+                                                <button class="action-btn danger" onclick="deleteProposal(<?= $proposal['id'] ?>)">
+                                                    <i class="fa-solid fa-trash mr-1"></i>Delete
+                                                </button>
+                                            </td>
                                         </tr>
                                     <?php endforeach; ?>
                                 <?php endif; ?>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+                
+                <!-- Information Box -->
+                <div class="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
+                    <div class="flex items-start">
+                        <div class="flex-shrink-0">
+                            <i class="fa-solid fa-info-circle text-blue-500 text-xl"></i>
+                        </div>
+                        <div class="ml-3">
+                            <h3 class="text-sm font-medium text-blue-800">How Budget Allocations Work</h3>
+                            <div class="mt-2 text-sm text-blue-700">
+                                <ul class="list-disc pl-5 space-y-1">
+                                    <li>When you create a budget allocation, it's automatically recorded in Accounts Receivable</li>
+                                    <li>Each department gets its own budget account in the AR system</li>
+                                    <li>Budget amounts appear in the "Budget Allocations" tab of Payable/Receivable</li>
+                                    <li>No approval or rejection is needed - allocations are immediate</li>
+                                    <li>To view budget allocations in AR, click "View in AR" or go to Payable/Receivable → Budget Allocations tab</li>
+                                </ul>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1523,67 +1504,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                 });
             }
 
-            // Budget items functionality for create proposal modal
-            const addBudgetItemBtn = document.getElementById('add-budget-item-btn');
-            const budgetItemsContainer = document.getElementById('budget-items-container');
-            let budgetItemCount = 0;
-
-            if (addBudgetItemBtn && budgetItemsContainer) {
-                addBudgetItemBtn.addEventListener('click', function() {
-                    addBudgetItem();
-                });
-
-                // Add first budget item by default
-                addBudgetItem();
-            }
-
-            function addBudgetItem() {
-                budgetItemCount++;
-                const itemId = `budget_item_${budgetItemCount}`;
-                
-                const budgetItemHtml = `
-                    <div class="budget-item-form" id="${itemId}">
-                        <div class="flex justify-between items-center mb-3">
-                            <h4 class="font-medium">Budget Item #${budgetItemCount}</h4>
-                            <button type="button" class="remove-item-btn" onclick="removeBudgetItem('${itemId}')">
-                                <i class="fas fa-times mr-1"></i>Remove
-                            </button>
-                        </div>
-                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-3">
-                            <div class="form-group">
-                                <label class="form-label">Category*</label>
-                                <select name="budget_items[${budgetItemCount}][category]" class="form-select" required>
-                                    <option value="">Select Category</option>
-                                    <?php foreach ($categories as $category): ?>
-                                        <option value="<?= safe_output($category['id']) ?>">
-                                            <?= safe_output($category['name']) ?> (<?= safe_output($category['type']) ?>)
-                                        </option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Description*</label>
-                                <input type="text" name="budget_items[${budgetItemCount}][description]" class="form-input" required placeholder="Item description">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Quantity*</label>
-                                <input type="number" name="budget_items[${budgetItemCount}][quantity]" class="form-input" value="1" min="1" required>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Unit Cost (₱)*</label>
-                                <input type="number" name="budget_items[${budgetItemCount}][unit_cost]" class="form-input" step="0.01" min="0" required placeholder="0.00">
-                            </div>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Justification</label>
-                            <textarea name="budget_items[${budgetItemCount}][justification]" class="form-textarea" rows="2" placeholder="Why is this item needed?"></textarea>
-                        </div>
-                    </div>
-                `;
-                
-                budgetItemsContainer.insertAdjacentHTML('beforeend', budgetItemHtml);
-            }
-
             // Load edit modal content when opening
             window.openEditModal = function(proposalId) {
                 console.log('Opening edit modal for proposal:', proposalId);
@@ -1592,7 +1512,7 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                 document.getElementById('edit-modal-content').innerHTML = `
                     <div class="text-center py-8">
                         <i class="fas fa-spinner fa-spin text-2xl text-primary-green mb-2"></i>
-                        <p>Loading proposal details...</p>
+                        <p>Loading budget details...</p>
                     </div>
                 `;
                 
@@ -1610,7 +1530,7 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                         document.getElementById('edit-modal-content').innerHTML = `
                             <div class="text-center py-8 text-red-600">
                                 <i class="fas fa-exclamation-triangle text-2xl mb-2"></i>
-                                <p>Error loading proposal details. Please try again.</p>
+                                <p>Error loading budget details. Please try again.</p>
                             </div>
                         `;
                     });
@@ -1665,13 +1585,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
         });
 
         // Global functions
-        function removeBudgetItem(itemId) {
-            const itemElement = document.getElementById(itemId);
-            if (itemElement) {
-                itemElement.remove();
-            }
-        }
-
         // Modal functions
         function openModal(modalId) {
             const modal = document.getElementById(modalId);
@@ -1695,7 +1608,7 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
         }
 
         function deleteProposal(proposalId) {
-            if (confirm('Are you sure you want to delete this proposal?')) {
+            if (confirm('Are you sure you want to delete this budget allocation? This will also remove it from Accounts Receivable.')) {
                 const form = document.createElement('form');
                 form.method = 'POST';
                 form.innerHTML = `
