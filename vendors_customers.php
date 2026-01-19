@@ -166,63 +166,48 @@ function formatCount($count, $show_numbers = false) {
     }
 }
 
-// NEW: Function to get budget-related AR contacts (department budgets)
+// UPDATED: Function to get budget-related AR contacts (department budgets)
 function getBudgetContacts(PDO $db): array {
     $sql = "SELECT 
                 bc.*,
                 -- For budget AR contacts, net balance should be POSITIVE (allocated budget)
-                (
-                    SELECT COALESCE(SUM(p.amount), 0) 
-                    FROM payments p
-                    WHERE p.contact_id = bc.id 
-                    AND p.type = 'Receive' 
-                    AND p.status = 'Completed'
-                    -- REMOVED: AND p.description LIKE '%Budget allocation%'
+                COALESCE(
+                    (SELECT SUM(i.amount) 
+                     FROM invoices i 
+                     WHERE i.contact_id = bc.id 
+                     AND i.type = 'Receivable' 
+                     AND i.status = 'Paid'), 0
                 ) as net_balance,
                 
-                -- Total budget payments received
-                (
-                    SELECT COALESCE(SUM(p.amount), 0) 
-                    FROM payments p
-                    WHERE p.contact_id = bc.id 
-                    AND p.type = 'Receive' 
-                    AND p.status = 'Completed'
-                    -- REMOVED: AND p.description LIKE '%Budget allocation%'
-                ) as total_payments,
+                -- Count of budget invoices
+                (SELECT COUNT(*) 
+                 FROM invoices i 
+                 WHERE i.contact_id = bc.id 
+                 AND i.type = 'Receivable') as invoice_count,
                 
-                -- Count of budget payments
-                (
-                    SELECT COUNT(*) 
-                    FROM payments p
-                    WHERE p.contact_id = bc.id 
-                    AND p.type = 'Receive' 
-                    AND p.status = 'Completed'
-                    -- REMOVED: AND p.description LIKE '%Budget allocation%'
-                ) as payment_count,
+                -- Get latest budget proposal info
+                (SELECT GROUP_CONCAT(DISTINCT SUBSTRING(i.description, 1, 50) SEPARATOR ', ')
+                 FROM invoices i
+                 WHERE i.contact_id = bc.id 
+                 AND i.type = 'Receivable'
+                 LIMIT 3
+                ) as recent_invoices,
                 
-                -- Get latest budget proposal info from INVOICES instead of payments
-                (
-                    SELECT GROUP_CONCAT(DISTINCT SUBSTRING(i.description, 1, 50) SEPARATOR ', ')
-                    FROM invoices i
-                    WHERE i.contact_id = bc.id 
-                    AND i.type = 'Receivable'
-                    AND i.description LIKE '%Budget Allocation%'
-                    LIMIT 3
-                ) as recent_budgets,
+                -- Get total amount from invoices
+                (SELECT COALESCE(SUM(i.amount), 0) 
+                 FROM invoices i
+                 WHERE i.contact_id = bc.id 
+                 AND i.type = 'Receivable') as total_invoiced,
                 
-                -- Get total budget amount from invoices
-                (
-                    SELECT COALESCE(SUM(i.amount), 0) 
-                    FROM invoices i
-                    WHERE i.contact_id = bc.id 
-                    AND i.type = 'Receivable'
-                    AND i.description LIKE '%Budget Allocation%'
-                ) as total_invoiced
+                -- Payment count
+                (SELECT COUNT(*) 
+                 FROM payments p
+                 WHERE p.contact_id = bc.id 
+                 AND p.type = 'Receive') as payment_count
             FROM business_contacts bc
             WHERE bc.status = 'Active' 
             AND bc.type = 'Customer'
             AND bc.contact_person = 'System Generated'
-            AND bc.email = 'system@company.com'
             GROUP BY bc.id
             ORDER BY bc.name";
     
@@ -269,7 +254,7 @@ function getVendors(PDO $db): array {
             ) p ON i.id = p.invoice_id
             LEFT JOIN invoices p_inv ON bc.id = p_inv.contact_id AND p_inv.status = 'Paid'
             WHERE bc.status = 'Active' AND bc.type = 'Customer'
-AND bc.contact_person != 'System Generated'  // Exclude system-generated contacts
+            AND bc.contact_person != 'System Generated'  // Exclude system-generated contacts
             GROUP BY bc.id
             ORDER BY bc.name";
     
@@ -363,6 +348,52 @@ function getRecentBudgetApprovals(PDO $db): array {
     } catch (PDOException $e) {
         error_log("Error fetching recent budget approvals: " . $e->getMessage());
         return [];
+    }
+}
+
+// Function to create budget allocation contact
+function createBudgetAllocationContact(PDO $db, string $department_name, string $proposal_title, float $amount): ?int {
+    try {
+        // Generate a unique contact ID for budget allocation
+        $prefix = 'AR-BUDGET-';
+        
+        // Get the highest existing number
+        $sql = "SELECT MAX(CAST(SUBSTRING(contact_id, 11) AS UNSIGNED)) as max_num 
+                FROM business_contacts 
+                WHERE contact_id LIKE ?";
+        $stmt = $db->prepare($sql);
+        $stmt->execute([$prefix . '%']);
+        $result = $stmt->fetch();
+        
+        $next_num = ($result['max_num'] ?? 0) + 1;
+        $contact_id = $prefix . str_pad((string)$next_num, 3, '0', STR_PAD_LEFT);
+        
+        // Insert the budget allocation contact
+        $sql = "INSERT INTO business_contacts 
+                (contact_id, name, contact_person, email, phone, type, status, created_at) 
+                VALUES (?, ?, 'System Generated', 'system@company.com', 'N/A', 'Customer', 'Active', NOW())";
+        
+        $stmt = $db->prepare($sql);
+        $stmt->execute([$contact_id, $department_name . ' Budget']);
+        
+        $contact_id = $db->lastInsertId();
+        
+        // Also create an invoice for this budget allocation
+        $invoice_sql = "INSERT INTO invoices 
+                       (contact_id, invoice_number, description, amount, type, status, issue_date, due_date, created_at)
+                       VALUES (?, ?, ?, ?, 'Receivable', 'Paid', NOW(), DATE_ADD(NOW(), INTERVAL 1 YEAR), NOW())";
+        
+        $invoice_number = 'BUDGET-' . date('Ymd') . '-' . str_pad($next_num, 3, '0', STR_PAD_LEFT);
+        $description = "Budget Allocation: " . $proposal_title;
+        
+        $invoice_stmt = $db->prepare($invoice_sql);
+        $invoice_stmt->execute([$contact_id, $invoice_number, $description, $amount]);
+        
+        return $contact_id;
+        
+    } catch (PDOException $e) {
+        error_log("Error creating budget allocation contact: " . $e->getMessage());
+        return null;
     }
 }
 
@@ -912,11 +943,13 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
 
         html, body {
             height: 100%;
+            margin: 0;
         }
         
         .page-container {
             display: flex;
             min-height: 100vh;
+            flex-direction: column;
         }
         
         .sidebar-content {
@@ -1221,7 +1254,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         }
     </style>
 </head>
-<body class="bg-gray-bg">
+<body class="bg-gray-bg flex flex-col min-h-screen">
     <!-- Overlay for mobile sidebar -->
     <div class="overlay" id="overlay"></div>
     
@@ -1333,7 +1366,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
     </div>
     
     <!-- Page Container -->
-    <div class="page-container">
+    <div class="flex flex-1">
         <!-- Sidebar -->
         <div id="sidebar" class="w-64 flex flex-col fixed md:relative">
             <div class="sidebar-content">
@@ -1440,7 +1473,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         </div>
         
         <!-- Main Content -->
-        <div id="main-content" class="flex-1 overflow-y-auto flex flex-col">
+        <div id="main-content" class="flex-1 flex flex-col min-h-screen">
             <!-- Header -->
             <div class="bg-primary-green text-white p-4 flex justify-between items-center">
                 <div class="flex items-center">
@@ -1504,7 +1537,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                 </div>
             </div>
             
-            <!-- Rest of your HTML content remains exactly the same -->
+            <!-- Main Content Area -->
             <div class="p-6 flex-1">
                 <!-- Success and Error Messages -->
                 <?php if (!empty($success_message)): ?>
@@ -1519,38 +1552,37 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     </div>
                 <?php endif; ?>
 
-              <!-- Search Section - UPDATED (removed status filter) -->
-<div class="bg-white rounded-xl p-6 card-shadow mb-6">
-    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-        <div class="flex-1">
-            <div class="relative">
-                <input type="text" id="search-contacts" placeholder="Search contacts by company name, contact person, email, or ID..." 
-                       class="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-green focus:border-transparent">
-                <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <i class='bx bx-search text-gray-400'></i>
+                <!-- Search Section -->
+                <div class="bg-white rounded-xl p-6 card-shadow mb-6">
+                    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                        <div class="flex-1">
+                            <div class="relative">
+                                <input type="text" id="search-contacts" placeholder="Search contacts by company name, contact person, email, or ID..." 
+                                       class="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-green focus:border-transparent">
+                                <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                                    <i class='bx bx-search text-gray-400'></i>
+                                </div>
+                            </div>
+                            
+                        </div>
+                        <div class="flex space-x-2">
+                            <button id="clear-search" class="btn btn-secondary whitespace-nowrap">
+                                <i class='bx bx-reset mr-2'></i>Clear
+                            </button>
+                            <div class="relative">
+                                <select id="filter-balance" class="form-input pr-8">
+                                    <option value="">All Balances</option>
+                                    <option value="positive">Positive Balance</option>
+                                    <option value="negative">Negative Balance</option>
+                                    <option value="zero">Zero Balance</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="search-results-info" class="mt-3 text-sm text-gray-600 hidden">
+                        <span id="results-count">0</span> contacts found
+                    </div>
                 </div>
-            </div>
-            
-        </div>
-        <div class="flex space-x-2">
-            <button id="clear-search" class="btn btn-secondary whitespace-nowrap">
-                <i class='bx bx-reset mr-2'></i>Clear
-            </button>
-            <!-- REMOVED: Status filter dropdown -->
-            <div class="relative">
-                <select id="filter-balance" class="form-input pr-8">
-                    <option value="">All Balances</option>
-                    <option value="positive">Positive Balance</option>
-                    <option value="negative">Negative Balance</option>
-                    <option value="zero">Zero Balance</option>
-                </select>
-            </div>
-        </div>
-    </div>
-    <div id="search-results-info" class="mt-3 text-sm text-gray-600 hidden">
-        <span id="results-count">0</span> contacts found
-    </div>
-</div>
               
                 <!-- Summary Cards - UPDATED with Budget Allocations -->
                 <div class="grid grid-cols-1 md:grid-cols-5 gap-6 mb-6">
@@ -1616,263 +1648,267 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     </div>
                 </div>
 
-                <!-- Tabs Container - UPDATED with Budget Allocations Tab -->
+                <!-- Tabs Container - UPDATED with only two tabs -->
                 <div class="bg-white rounded-xl card-shadow">
                     <div class="tab-container">
                         <div class="tab active" data-tab="vendors">Accounts Payable</div>
                         <div class="tab" data-tab="customers">Accounts Receivable</div>
-                        <div class="tab" data-tab="budgets">Budget Allocations</div>
                     </div>
 
                     <div class="p-6">
                         <!-- Accounts Payable Tab -->
-<div class="tab-content active" id="vendors-tab">
-    <div class="flex justify-between items-center mb-6">
-        <h3 class="text-lg font-bold text-dark-text">Accounts Payable Management</h3>
-        <button class="btn btn-primary" onclick="openVendorModal()">
-            <i class='bx bx-plus mr-2'></i>Add AP Contact
-        </button>
-    </div>
-    
-    <div class="overflow-x-auto">
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Contact ID</th>
-                    <th>Company Name</th>
-                    <th>Contact Person</th>
-                    <th>Email</th>
-                    <th>Phone</th>
-                    <th>Net Balance</th>
-                    <th>Total Payments</th>
-                    <!-- REMOVED: Status column -->
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php if (count($vendors) > 0): ?>
-                    <?php foreach ($vendors as $vendor): ?>
-                    <tr>
-                        <td class="font-mono font-medium"><?php echo htmlspecialchars($vendor['contact_id']); ?></td>
-                        <td class="font-medium"><?php echo htmlspecialchars($vendor['name']); ?></td>
-                        <td><?php echo htmlspecialchars($vendor['contact_person']); ?></td>
-                        <td><?php echo htmlspecialchars($vendor['email']); ?></td>
-                        <td><?php echo htmlspecialchars($vendor['phone']); ?></td>
-                        <td class="<?php echo (float)$vendor['net_balance'] < 0 ? 'balance-negative' : 'balance-positive'; ?> <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                            <?php echo formatNumber((float)$vendor['net_balance'], $_SESSION['show_numbers']); ?>
-                        </td>
-                        <td class="<?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                            <?php echo formatNumber((float)$vendor['total_payments'], $_SESSION['show_numbers']); ?>
-                            <div class="text-xs text-gray-500"><?php echo $vendor['payment_count']; ?> payments</div>
-                        </td>
-                        <td>
-                            <div class="flex flex-wrap gap-2">
-                                <button class="action-btn record" title="Record Invoice" onclick="recordInvoiceForContact(<?php echo $vendor['id']; ?>, 'Vendor')">
-                                    <i class='bx bx-receipt mr-1'></i>Record
+                        <div class="tab-content active" id="vendors-tab">
+                            <div class="flex justify-between items-center mb-6">
+                                <h3 class="text-lg font-bold text-dark-text">Accounts Payable Management</h3>
+                                <button class="btn btn-primary" onclick="openVendorModal()">
+                                    <i class='bx bx-plus mr-2'></i>Add AP Contact
                                 </button>
-                                </div>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
-                <?php else: ?>
-                    <tr>
-                        <td colspan="8" class="text-center py-4 text-gray-500"> <!-- UPDATED: colspan from 9 to 8 -->
-                            No accounts payable contacts found. <button class="text-primary-green hover:underline" onclick="openVendorModal()">Add your first AP contact</button>
-                        </td>
-                    </tr>
-                <?php endif; ?>
-            </tbody>
-        </table>
-    </div>
-</div>
+                            </div>
+                            
+                            <div class="overflow-x-auto">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Contact ID</th>
+                                            <th>Company Name</th>
+                                            <th>Contact Person</th>
+                                            <th>Email</th>
+                                            <th>Phone</th>
+                                            <th>Net Balance</th>
+                                            <th>Total Payments</th>
+                                            <th>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php if (count($vendors) > 0): ?>
+                                            <?php foreach ($vendors as $vendor): ?>
+                                            <tr>
+                                                <td class="font-mono font-medium"><?php echo htmlspecialchars($vendor['contact_id']); ?></td>
+                                                <td class="font-medium"><?php echo htmlspecialchars($vendor['name']); ?></td>
+                                                <td><?php echo htmlspecialchars($vendor['contact_person']); ?></td>
+                                                <td><?php echo htmlspecialchars($vendor['email']); ?></td>
+                                                <td><?php echo htmlspecialchars($vendor['phone']); ?></td>
+                                                <td class="<?php echo (float)$vendor['net_balance'] < 0 ? 'balance-negative' : 'balance-positive'; ?> <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
+                                                    <?php echo formatNumber((float)$vendor['net_balance'], $_SESSION['show_numbers']); ?>
+                                                </td>
+                                                <td class="<?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
+                                                    <?php echo formatNumber((float)$vendor['total_payments'], $_SESSION['show_numbers']); ?>
+                                                    <div class="text-xs text-gray-500"><?php echo $vendor['payment_count']; ?> payments</div>
+                                                </td>
+                                                <td>
+                                                    <div class="flex flex-wrap gap-2">
+                                                        <button class="action-btn record" title="Record Invoice" onclick="recordInvoiceForContact(<?php echo $vendor['id']; ?>, 'Vendor')">
+                                                            <i class='bx bx-receipt mr-1'></i>Record
+                                                        </button>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                            <?php endforeach; ?>
+                                        <?php else: ?>
+                                            <tr>
+                                                <td colspan="8" class="text-center py-4 text-gray-500">
+                                                    No accounts payable contacts found. <button class="text-primary-green hover:underline" onclick="openVendorModal()">Add your first AP contact</button>
+                                                </td>
+                                            </tr>
+                                        <?php endif; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
 
-                        <!-- Accounts Receivable Tab -->
-<div class="tab-content" id="customers-tab">
-    <div class="flex justify-between items-center mb-6">
-        <h3 class="text-lg font-bold text-dark-text">Accounts Receivable Management</h3>
-        <button class="btn btn-primary" onclick="openCustomerModal()">
-            <i class='bx bx-plus mr-2'></i>Add AR Contact
-        </button>
-    </div>
-    
-    <div class="overflow-x-auto">
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Contact ID</th>
-                    <th>Company Name</th>
-                    <th>Contact Person</th>
-                    <th>Email</th>
-                    <th>Phone</th>
-                    <th>Net Balance</th>
-                    <th>Total Payments</th>
-                    <!-- REMOVED: Status column -->
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php if (count($customers) > 0): ?>
-                    <?php foreach ($customers as $customer): ?>
-                    <tr>
-                        <td class="font-mono font-medium"><?php echo htmlspecialchars($customer['contact_id']); ?></td>
-                        <td class="font-medium"><?php echo htmlspecialchars($customer['name']); ?></td>
-                        <td><?php echo htmlspecialchars($customer['contact_person']); ?></td>
-                        <td><?php echo htmlspecialchars($customer['email']); ?></td>
-                        <td><?php echo htmlspecialchars($customer['phone']); ?></td>
-                        <td class="<?php echo (float)$customer['net_balance'] < 0 ? 'balance-negative' : 'balance-positive'; ?> <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                            <?php echo formatNumber((float)$customer['net_balance'], $_SESSION['show_numbers']); ?>
-                        </td>
-                        <td class="<?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                            <?php echo formatNumber((float)$customer['total_payments'], $_SESSION['show_numbers']); ?>
-                            <div class="text-xs text-gray-500"><?php echo $customer['payment_count']; ?> payments</div>
-                        </td>
-                        <td>
-                            <div class="flex flex-wrap gap-2">
-                                <button class="action-btn record" title="Record Invoice" onclick="recordInvoiceForContact(<?php echo $vendor['id']; ?>, 'Vendor')">
-                                    <i class='bx bx-receipt mr-1'></i>Record
+                        <!-- Accounts Receivable Tab with Budget Allocations INSIDE -->
+                        <div class="tab-content" id="customers-tab">
+                            <div class="flex justify-between items-center mb-6">
+                                <h3 class="text-lg font-bold text-dark-text">Accounts Receivable Management</h3>
+                                <button class="btn btn-primary" onclick="openCustomerModal()">
+                                    <i class='bx bx-plus mr-2'></i>Add AR Contact
                                 </button>
+                            </div>
+                            
+                            <!-- Regular AR Customers Table -->
+                            <div class="mb-8">
+                                <h4 class="text-lg font-bold text-dark-text mb-4">Regular AR Customers</h4>
+                                <div class="overflow-x-auto">
+                                    <table class="data-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Contact ID</th>
+                                                <th>Company Name</th>
+                                                <th>Contact Person</th>
+                                                <th>Email</th>
+                                                <th>Phone</th>
+                                                <th>Net Balance</th>
+                                                <th>Total Payments</th>
+                                                <th>Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <?php 
+                                            // Filter out system-generated contacts from regular customers
+                                            $regular_customers = array_filter($customers, function($customer) {
+                                                return $customer['contact_person'] !== 'System Generated';
+                                            });
+                                            ?>
+                                            <?php if (count($regular_customers) > 0): ?>
+                                                <?php foreach ($regular_customers as $customer): ?>
+                                                <tr>
+                                                    <td class="font-mono font-medium"><?php echo htmlspecialchars($customer['contact_id']); ?></td>
+                                                    <td class="font-medium"><?php echo htmlspecialchars($customer['name']); ?></td>
+                                                    <td><?php echo htmlspecialchars($customer['contact_person']); ?></td>
+                                                    <td><?php echo htmlspecialchars($customer['email']); ?></td>
+                                                    <td><?php echo htmlspecialchars($customer['phone']); ?></td>
+                                                    <td class="<?php echo (float)$customer['net_balance'] < 0 ? 'balance-negative' : 'balance-positive'; ?> <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
+                                                        <?php echo formatNumber((float)$customer['net_balance'], $_SESSION['show_numbers']); ?>
+                                                    </td>
+                                                    <td class="<?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
+                                                        <?php echo formatNumber((float)$customer['total_payments'], $_SESSION['show_numbers']); ?>
+                                                        <div class="text-xs text-gray-500"><?php echo $customer['payment_count']; ?> payments</div>
+                                                    </td>
+                                                    <td>
+                                                        <div class="flex flex-wrap gap-2">
+                                                            <button class="action-btn record" title="Record Invoice" onclick="recordInvoiceForContact(<?php echo $customer['id']; ?>, 'Customer')">
+                                                                <i class='bx bx-receipt mr-1'></i>Record
+                                                            </button>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                                <?php endforeach; ?>
+                                            <?php else: ?>
+                                                <tr>
+                                                    <td colspan="8" class="text-center py-4 text-gray-500">
+                                                        No regular accounts receivable contacts found. <button class="text-primary-green hover:underline" onclick="openCustomerModal()">Add your first AR contact</button>
+                                                    </td>
+                                                </tr>
+                                            <?php endif; ?>
+                                        </tbody>
+                                    </table>
                                 </div>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
-                <?php else: ?>
-                    <tr>
-                        <td colspan="8" class="text-center py-4 text-gray-500"> <!-- UPDATED: colspan from 9 to 8 -->
-                            No accounts receivable contacts found. <button class="text-primary-green hover:underline" onclick="openCustomerModal()">Add your first AR contact</button>
-                        </td>
-                    </tr>
-                <?php endif; ?>
-            </tbody>
-        </table>
-    </div>
-</div>
-
-<!-- NEW: Budget Allocations Tab -->
-<div class="tab-content" id="budgets-tab">
-    <div class="flex justify-between items-center mb-6">
-        <h3 class="text-lg font-bold text-dark-text">Budget Allocations (Approved Proposals)</h3>
-        <button class="btn btn-primary" onclick="window.location.href='budget_proposal.php'">
-            <i class='bx bx-wallet mr-2'></i>Manage Budgets
-        </button>
-    </div>
-    
-    <?php if (count($budget_contacts) > 0): ?>
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-6">
-            <?php foreach ($budget_contacts as $budget): ?>
-                <div class="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl p-6 border border-blue-200">
-                    <div class="flex items-center justify-between mb-4">
-                        <div>
-                            <h4 class="font-bold text-lg text-dark-text"><?php echo htmlspecialchars($budget['name']); ?></h4>
-                            <p class="text-sm text-gray-600"><?php echo htmlspecialchars($budget['contact_id']); ?></p>
+                            </div>
+                            
+                            <!-- Budget Allocations Section - MOVED HERE -->
+                            <div class="mb-8">
+                                <h4 class="text-lg font-bold text-dark-text mb-4">Budget Allocations (Department Budgets)</h4>
+                                
+                                <?php if (count($budget_contacts) > 0): ?>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-6">
+                                        <?php foreach ($budget_contacts as $budget): ?>
+                                            <div class="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl p-6 border border-blue-200">
+                                                <div class="flex items-center justify-between mb-4">
+                                                    <div>
+                                                        <h4 class="font-bold text-lg text-dark-text"><?php echo htmlspecialchars($budget['name']); ?></h4>
+                                                        <p class="text-sm text-gray-600"><?php echo htmlspecialchars($budget['contact_id']); ?></p>
+                                                    </div>
+                                                    <span class="budget-badge">Budget</span>
+                                                </div>
+                                                
+                                                <div class="mb-4">
+                                                    <p class="text-sm text-gray-600 mb-2">Total Allocated Budget:</p>
+                                                    <p class="text-2xl font-bold text-primary-green <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
+                                                        <?php echo formatNumber((float)$budget['net_balance'], $_SESSION['show_numbers']); ?>
+                                                    </p>
+                                                </div>
+                                                
+                                                <?php if (!empty($budget['recent_invoices'])): ?>
+                                                    <div class="mb-4">
+                                                        <p class="text-sm font-medium text-gray-700 mb-1">Recent Budgets:</p>
+                                                        <p class="text-sm text-gray-600"><?php echo htmlspecialchars($budget['recent_invoices']); ?></p>
+                                                    </div>
+                                                <?php endif; ?>
+                                                
+                                                <div class="flex justify-between items-center">
+                                                    <div>
+                                                        <p class="text-sm text-gray-600">Payments: <span class="font-medium"><?php echo $budget['payment_count']; ?></span></p>
+                                                    </div>
+                                                    <button class="text-primary-green hover:text-primary-green/80 font-medium text-sm" onclick="viewBudgetDetails('<?php echo $budget['id']; ?>')">
+                                                        View Details →
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                    
+                                    <!-- Recent Budget Approvals Table -->
+                                    <div class="mt-8">
+                                        <h4 class="text-lg font-bold text-dark-text mb-4">Recent Budget Approvals</h4>
+                                        <div class="overflow-x-auto">
+                                            <table class="data-table">
+                                                <thead>
+                                                    <tr>
+                                                        <th>Proposal Title</th>
+                                                        <th>Department</th>
+                                                        <th>Amount</th>
+                                                        <th>Approval Date</th>
+                                                        <th>Approved By</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    <?php if (count($recent_budget_approvals) > 0): ?>
+                                                        <?php foreach ($recent_budget_approvals as $approval): ?>
+                                                            <tr>
+                                                                <td class="font-medium"><?php echo htmlspecialchars($approval['title']); ?></td>
+                                                                <td><?php echo htmlspecialchars($approval['department_name']); ?></td>
+                                                                <td class="<?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
+                                                                    <?php echo formatNumber((float)$approval['total_amount'], $_SESSION['show_numbers']); ?>
+                                                                </td>
+                                                                <td><?php echo date('M j, Y', strtotime($approval['approval_date'])); ?></td>
+                                                                <td><?php echo htmlspecialchars($approval['approved_by'] ?? 'System'); ?></td>
+                                                            </tr>
+                                                        <?php endforeach; ?>
+                                                    <?php else: ?>
+                                                        <tr>
+                                                            <td colspan="5" class="text-center py-4 text-gray-500">
+                                                                No recent budget approvals found.
+                                                            </td>
+                                                        </tr>
+                                                    <?php endif; ?>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                <?php else: ?>
+                                    <div class="text-center py-8 border-t border-gray-200">
+                                        <i class='bx bx-wallet text-4xl text-gray-400 mb-4'></i>
+                                        <h4 class="text-lg font-medium text-gray-700 mb-2">No Budget Allocations Yet</h4>
+                                        <p class="text-gray-500 mb-6">Approved budget proposals will appear here as accounts receivable allocations.</p>
+                                        <button class="btn btn-primary" onclick="window.location.href='budget_proposal.php'">
+                                            <i class='bx bx-plus mr-2'></i>Create Budget Proposal
+                                        </button>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
                         </div>
-                        <span class="budget-badge">Budget</span>
-                    </div>
-                    
-                    <div class="mb-4">
-                        <p class="text-sm text-gray-600 mb-2">Total Allocated Budget:</p>
-                        <p class="text-2xl font-bold text-primary-green <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                            <?php echo formatNumber((float)$budget['net_balance'], $_SESSION['show_numbers']); ?>
-                        </p>
-                    </div>
-                    
-                    <?php if (!empty($budget['recent_budgets'])): ?>
-                        <div class="mb-4">
-                            <p class="text-sm font-medium text-gray-700 mb-1">Recent Budgets:</p>
-                            <p class="text-sm text-gray-600"><?php echo htmlspecialchars($budget['recent_budgets']); ?></p>
-                        </div>
-                    <?php endif; ?>
-                    
-                    <div class="flex justify-between items-center">
-                        <div>
-                            <p class="text-sm text-gray-600">Payments: <span class="font-medium"><?php echo $budget['payment_count']; ?></span></p>
-                        </div>
-                        <button class="text-primary-green hover:text-primary-green/80 font-medium text-sm" onclick="viewBudgetDetails('<?php echo $budget['id']; ?>')">
-                            View Details →
-                        </button>
                     </div>
                 </div>
-            <?php endforeach; ?>
-        </div>
-        
-        <!-- Recent Budget Approvals Table -->
-        <div class="mt-8">
-            <h4 class="text-lg font-bold text-dark-text mb-4">Recent Budget Approvals</h4>
-            <div class="overflow-x-auto">
-                <table class="data-table">
-                    <thead>
-                        <tr>
-                            <th>Proposal Title</th>
-                            <th>Department</th>
-                            <th>Amount</th>
-                            <th>Approval Date</th>
-                            <th>Approved By</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php if (count($recent_budget_approvals) > 0): ?>
-                            <?php foreach ($recent_budget_approvals as $approval): ?>
-                                <tr>
-                                    <td class="font-medium"><?php echo htmlspecialchars($approval['title']); ?></td>
-                                    <td><?php echo htmlspecialchars($approval['department_name']); ?></td>
-                                    <td class="<?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                                        <?php echo formatNumber((float)$approval['total_amount'], $_SESSION['show_numbers']); ?>
-                                    </td>
-                                    <td><?php echo date('M j, Y', strtotime($approval['approval_date'])); ?></td>
-                                    <td><?php echo htmlspecialchars($approval['approved_by'] ?? 'System'); ?></td>
-                                </tr>
-                            <?php endforeach; ?>
-                        <?php else: ?>
-                            <tr>
-                                <td colspan="5" class="text-center py-4 text-gray-500">
-                                    No recent budget approvals found.
-                                </td>
-                            </tr>
-                        <?php endif; ?>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    <?php else: ?>
-        <div class="text-center py-8">
-            <i class='bx bx-wallet text-4xl text-gray-400 mb-4'></i>
-            <h3 class="text-lg font-medium text-gray-700 mb-2">No Budget Allocations Yet</h3>
-            <p class="text-gray-500 mb-6">Approved budget proposals will appear here as accounts receivable allocations.</p>
-            <button class="btn btn-primary" onclick="window.location.href='budget_proposal.php'">
-                <i class='bx bx-plus mr-2'></i>Create Budget Proposal
-            </button>
-        </div>
-    <?php endif; ?>
-</div>
 
-</div> </div> <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
-    <div class="bg-white rounded-xl p-6 card-shadow">
-        <h3 class="text-lg font-bold text-dark-text mb-4">Quick Actions</h3>
-        <div class="space-y-3">
-            <button class="btn btn-primary w-full text-left" onclick="openVendorModal()">
-                <i class='bx bx-plus mr-2'></i>Add Accounts Payable Contact
-            </button>
-            <button class="btn btn-primary w-full text-left" onclick="openCustomerModal()">
-                <i class='bx bx-plus mr-2'></i>Add Accounts Receivable Contact
-            </button>
-            <button class="btn btn-secondary w-full text-left" onclick="window.location.href='payment_entry.php'">
-                <i class='bx bx-credit-card mr-2'></i>Record Payment
-            </button>
-            <button class="btn btn-secondary w-full text-left" onclick="window.location.href='invoices.php'">
-                <i class='bx bx-receipt mr-2'></i>Manage Invoices
-            </button>
-            <button class="btn btn-secondary w-full text-left" onclick="window.location.href='budget_proposal.php'">
-                <i class='bx bx-wallet mr-2'></i>Manage Budget Proposals
-            </button>
-        </div>
-    </div>
-    
-    <div class="bg-white rounded-xl p-6 card-shadow">
-        <h3 class="text-lg font-bold text-dark-text mb-4">Recent Activity</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+                    <div class="bg-white rounded-xl p-6 card-shadow">
+                        <h3 class="text-lg font-bold text-dark-text mb-4">Quick Actions</h3>
+                        <div class="space-y-3">
+                            <button class="btn btn-primary w-full text-left" onclick="openVendorModal()">
+                                <i class='bx bx-plus mr-2'></i>Add Accounts Payable Contact
+                            </button>
+                            <button class="btn btn-primary w-full text-left" onclick="openCustomerModal()">
+                                <i class='bx bx-plus mr-2'></i>Add Accounts Receivable Contact
+                            </button>
+                            <button class="btn btn-secondary w-full text-left" onclick="window.location.href='payment_entry.php'">
+                                <i class='bx bx-credit-card mr-2'></i>Record Payment
+                            </button>
+                            <button class="btn btn-secondary w-full text-left" onclick="window.location.href='invoices.php'">
+                                <i class='bx bx-receipt mr-2'></i>Manage Invoices
+                            </button>
+                            <button class="btn btn-secondary w-full text-left" onclick="window.location.href='budget_proposal.php'">
+                                <i class='bx bx-wallet mr-2'></i>Manage Budget Proposals
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="bg-white rounded-xl p-6 card-shadow">
+                        <h3 class="text-lg font-bold text-dark-text mb-4">Recent Activity</h3>
                         <div class="space-y-3">
                             <?php
                             // Get recent activity - you can enhance this with actual recent activities
                             $recent_vendors = array_slice($vendors, 0, 1);
-                            $recent_customers = array_slice($customers, 0, 1);
+                            $recent_customers = array_slice($regular_customers, 0, 1);
                             $recent_budgets = array_slice($recent_budget_approvals, 0, 2);
                             ?>
                             
@@ -1911,7 +1947,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             </div>
             
             <!-- Footer -->
-            <footer class="main-footer">
+            <footer class="main-footer mt-auto">
                 <div class="text-center">
                     <p class="text-sm">© 2025 Financial Dashboard. All rights reserved.</p>
                     <p class="text-xs mt-1 opacity-80">Powered by Microfinancial Management System</p>
@@ -1974,7 +2010,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             });
         });
 
-        // Tab functionality - UPDATED for budget tab
+        // Tab functionality - UPDATED for only two tabs
         const tabs = document.querySelectorAll('.tab');
         tabs.forEach(function(tab) {
             tab.addEventListener('click', function() {
@@ -2118,6 +2154,9 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                 submitBtn.disabled = true;
             });
         }
+        
+        // Initialize search functionality
+        initializeSearch();
     });
 
     // NEW: Function to view budget details
@@ -2257,166 +2296,130 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         window.location.href = 'invoices.php?contact_id=' + contactId + '&type=' + invoiceType + '&from_contact=1';
     }
       
-      // Search functionality - UPDATED (status removed)
-function performSearch() {
-    const searchInput = document.getElementById('search-contacts');
-    const selectedBalance = document.getElementById('filter-balance')?.value || '';
-    const searchResultsInfo = document.getElementById('search-results-info');
-    const resultsCount = document.getElementById('results-count');
-    
-    if (!searchInput || !searchResultsInfo) return;
-    
-    const searchTerm = searchInput.value.toLowerCase().trim();
-    
-    const activeTab = document.querySelector('.tab.active')?.getAttribute('data-tab');
-    if (!activeTab) return;
-    
-    let tableBody;
-    if (activeTab === 'budgets') {
-        // For budgets tab, we need to search through the grid
-        const budgetCards = document.querySelectorAll('#budgets-tab .bg-gradient-to-r');
-        let visibleCards = 0;
+    // Search functionality
+    function performSearch() {
+        const searchInput = document.getElementById('search-contacts');
+        const selectedBalance = document.getElementById('filter-balance')?.value || '';
+        const searchResultsInfo = document.getElementById('search-results-info');
+        const resultsCount = document.getElementById('results-count');
         
-        budgetCards.forEach(card => {
-            const cardText = card.textContent.toLowerCase();
-            const matchesSearch = !searchTerm || cardText.includes(searchTerm);
+        if (!searchInput || !searchResultsInfo) return;
+        
+        const searchTerm = searchInput.value.toLowerCase().trim();
+        
+        const activeTab = document.querySelector('.tab.active')?.getAttribute('data-tab');
+        if (!activeTab) return;
+        
+        let tableBody;
+        
+        tableBody = document.querySelector(`#${activeTab}-tab .data-table tbody`);
+        if (!tableBody) return;
+        
+        const rows = tableBody.querySelectorAll('tr');
+        let visibleRows = 0;
+        
+        rows.forEach(row => {
+            // Skip empty state rows
+            if (row.cells.length <= 1) return;
             
-            // For budget cards, we don't apply balance filter
-            const isVisible = matchesSearch;
-            card.style.display = isVisible ? '' : 'none';
+            const cells = row.cells;
+            const contactId = cells[0].textContent.toLowerCase();
+            const companyName = cells[1].textContent.toLowerCase();
+            const contactPerson = cells[2].textContent.toLowerCase();
+            const email = cells[3].textContent.toLowerCase();
+            const balanceCell = cells[5];
+            const balanceText = balanceCell.textContent;
+            
+            // Text search
+            const matchesSearch = !searchTerm || 
+                                 contactId.includes(searchTerm) || 
+                                 companyName.includes(searchTerm) || 
+                                 contactPerson.includes(searchTerm) || 
+                                 email.includes(searchTerm);
+            
+            // Balance filter
+            let matchesBalance = true;
+            if (selectedBalance) {
+                const balanceValue = parseFloat(balanceText.replace(/[^\d.-]/g, ''));
+                if (selectedBalance === 'positive' && balanceValue <= 0) matchesBalance = false;
+                if (selectedBalance === 'negative' && balanceValue >= 0) matchesBalance = false;
+                if (selectedBalance === 'zero' && balanceValue !== 0) matchesBalance = false;
+            }
+            
+            const isVisible = matchesSearch && matchesBalance;
+            row.style.display = isVisible ? '' : 'none';
             
             if (isVisible) {
-                visibleCards++;
+                visibleRows++;
             }
         });
         
         // Update results info
         if (searchTerm || selectedBalance) {
             searchResultsInfo.classList.remove('hidden');
-            resultsCount.textContent = visibleCards;
+            resultsCount.textContent = visibleRows;
         } else {
             searchResultsInfo.classList.add('hidden');
         }
         
-        return;
-    } else {
-        tableBody = document.querySelector(`#${activeTab}-tab .data-table tbody`);
-        if (!tableBody) return;
-    }
-    
-    const rows = tableBody.querySelectorAll('tr');
-    let visibleRows = 0;
-    
-    rows.forEach(row => {
-        // Skip empty state rows
-        if (row.cells.length <= 1) return;
-        
-        const cells = row.cells;
-        const contactId = cells[0].textContent.toLowerCase();
-        const companyName = cells[1].textContent.toLowerCase();
-        const contactPerson = cells[2].textContent.toLowerCase();
-        const email = cells[3].textContent.toLowerCase();
-        const balanceCell = cells[5]; // Updated position since status column is removed
-        const balanceText = balanceCell.textContent;
-        
-        // Text search
-        const matchesSearch = !searchTerm || 
-                             contactId.includes(searchTerm) || 
-                             companyName.includes(searchTerm) || 
-                             contactPerson.includes(searchTerm) || 
-                             email.includes(searchTerm);
-        
-        // Balance filter
-        let matchesBalance = true;
-        if (selectedBalance) {
-            const balanceValue = parseFloat(balanceText.replace(/[^\d.-]/g, ''));
-            if (selectedBalance === 'positive' && balanceValue <= 0) matchesBalance = false;
-            if (selectedBalance === 'negative' && balanceValue >= 0) matchesBalance = false;
-            if (selectedBalance === 'zero' && balanceValue !== 0) matchesBalance = false;
-        }
-        
-        const isVisible = matchesSearch && matchesBalance;
-        row.style.display = isVisible ? '' : 'none';
-        
-        if (isVisible) {
-            visibleRows++;
-        }
-    });
-    
-    // Update results info
-    if (searchTerm || selectedBalance) {
-        searchResultsInfo.classList.remove('hidden');
-        resultsCount.textContent = visibleRows;
-    } else {
-        searchResultsInfo.classList.add('hidden');
-    }
-    
-    // Show/hide empty state
-    const emptyStateRow = tableBody.querySelector('tr td[colspan]');
-    if (emptyStateRow) {
-        const parentRow = emptyStateRow.closest('tr');
-        if (visibleRows === 0 && !searchTerm && !selectedBalance) {
-            parentRow.style.display = '';
-        } else if (visibleRows === 0) {
-            parentRow.style.display = '';
-            emptyStateRow.textContent = 'No contacts found matching your search criteria.';
-        } else {
-            parentRow.style.display = 'none';
+        // Show/hide empty state
+        const emptyStateRow = tableBody.querySelector('tr td[colspan]');
+        if (emptyStateRow) {
+            const parentRow = emptyStateRow.closest('tr');
+            if (visibleRows === 0 && !searchTerm && !selectedBalance) {
+                parentRow.style.display = '';
+            } else if (visibleRows === 0) {
+                parentRow.style.display = '';
+                emptyStateRow.textContent = 'No contacts found matching your search criteria.';
+            } else {
+                parentRow.style.display = 'none';
+            }
         }
     }
-}
 
-function initializeSearch() {
-    const searchInput = document.getElementById('search-contacts');
-    const clearSearchBtn = document.getElementById('clear-search');
-    const filterBalance = document.getElementById('filter-balance');
-    const searchResultsInfo = document.getElementById('search-results-info');
-    const resultsCount = document.getElementById('results-count');
-    
-    if (!searchInput) return;
-    
-    // Event listeners
-    searchInput.addEventListener('input', performSearch);
-    if (filterBalance) {
-        filterBalance.addEventListener('change', performSearch);
-    }
-    
-    if (clearSearchBtn) {
-        clearSearchBtn.addEventListener('click', function() {
-            searchInput.value = '';
-            if (filterBalance) filterBalance.value = '';
-            performSearch();
-            searchInput.focus();
+    function initializeSearch() {
+        const searchInput = document.getElementById('search-contacts');
+        const clearSearchBtn = document.getElementById('clear-search');
+        const filterBalance = document.getElementById('filter-balance');
+        const searchResultsInfo = document.getElementById('search-results-info');
+        const resultsCount = document.getElementById('results-count');
+        
+        if (!searchInput) return;
+        
+        // Event listeners
+        searchInput.addEventListener('input', performSearch);
+        if (filterBalance) {
+            filterBalance.addEventListener('change', performSearch);
+        }
+        
+        if (clearSearchBtn) {
+            clearSearchBtn.addEventListener('click', function() {
+                searchInput.value = '';
+                if (filterBalance) filterBalance.value = '';
+                performSearch();
+                searchInput.focus();
+            });
+        }
+        
+        // Add keyboard shortcut
+        searchInput.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'k') {
+                e.preventDefault();
+                this.focus();
+            }
         });
+        
+        // Add global keyboard shortcut
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'k') {
+                e.preventDefault();
+                searchInput.focus();
+            }
+        });
+        
+        // Initial search to set up the state
+        performSearch();
     }
-    
-    // Add keyboard shortcut
-    searchInput.addEventListener('keydown', function(e) {
-        if (e.ctrlKey && e.key === 'k') {
-            e.preventDefault();
-            this.focus();
-        }
-    });
-    
-    // Add global keyboard shortcut
-    document.addEventListener('keydown', function(e) {
-        if (e.ctrlKey && e.key === 'k') {
-            e.preventDefault();
-            searchInput.focus();
-        }
-    });
-    
-    // Initial search to set up the state
-    performSearch();
-}
-
-// Initialize search when DOM is loaded
-document.addEventListener('DOMContentLoaded', function() {
-    // ... existing DOMContentLoaded code ...
-    
-    // Initialize search functionality
-    initializeSearch();
-});
       
     </script>
 </body>
