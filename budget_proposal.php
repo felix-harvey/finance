@@ -167,7 +167,7 @@ function handleCreateProposal(PDO $db, $user_id): void {
     $db->beginTransaction();
     
     try {
-        // Insert budget proposal with status 'Approved' (auto-allocated)
+        // 1. Insert budget proposal
         $stmt = $db->prepare("
             INSERT INTO budget_proposals 
             (title, department, fiscal_year, submitted_by, status, total_amount) 
@@ -176,7 +176,7 @@ function handleCreateProposal(PDO $db, $user_id): void {
         $stmt->execute([$title, $department, $fiscal_year, $user_id, $total_amount]);
         $proposal_id = $db->lastInsertId();
         
-        // Find or create a customer/AR contact for the department
+        // 2. Find or create a customer/AR contact for the department
         $dept_stmt = $db->prepare("SELECT name FROM departments WHERE id = ?");
         $dept_stmt->execute([$department]);
         $department_data = $dept_stmt->fetch();
@@ -193,10 +193,10 @@ function handleCreateProposal(PDO $db, $user_id): void {
             $contact_id = $contact['id'];
         } else {
             // Generate unique contact ID
-            $prefix = 'AR-BUDGET-';
+            $prefix = 'AR-BUD-'; 
             
-            // Get the highest existing number for system-generated budget contacts
-            $sql = "SELECT MAX(CAST(SUBSTRING(contact_id, 11) AS UNSIGNED)) as max_num 
+            // Get the highest existing number
+            $sql = "SELECT MAX(CAST(SUBSTRING(contact_id, 8) AS UNSIGNED)) as max_num 
                     FROM business_contacts 
                     WHERE type = 'Customer' 
                     AND contact_person = 'System Generated'
@@ -206,21 +206,7 @@ function handleCreateProposal(PDO $db, $user_id): void {
             $result = $stmt->fetch();
             
             $next_num = ($result['max_num'] ?? 0) + 1;
-            $contact_id_str = $prefix . str_pad((string)$next_num, 3, '0', STR_PAD_LEFT);
-            
-            // Check if contact ID already exists
-            $check_sql = "SELECT COUNT(*) as count FROM business_contacts WHERE contact_id = ?";
-            $check_stmt = $db->prepare($check_sql);
-            $check_stmt->execute([$contact_id_str]);
-            $exists = $check_stmt->fetch()['count'];
-            
-            // If exists, find next available number
-            while ($exists > 0) {
-                $next_num++;
-                $contact_id_str = $prefix . str_pad((string)$next_num, 3, '0', STR_PAD_LEFT);
-                $check_stmt->execute([$contact_id_str]);
-                $exists = $check_stmt->fetch()['count'];
-            }
+            $contact_id_str = $prefix . str_pad((string)$next_num, 4, '0', STR_PAD_LEFT);
             
             // Create new budget AR contact
             $insert_contact = $db->prepare("
@@ -232,37 +218,32 @@ function handleCreateProposal(PDO $db, $user_id): void {
             $contact_id = $db->lastInsertId();
         }
         
-        // Create an invoice for the budget allocation (Receivable type)
-        $invoice_ref = 'BUDGET-' . str_pad($proposal_id, 4, '0', STR_PAD_LEFT);
+        // 3. Create an invoice
+        // Shortened Invoice Number: BUD-{ID}
+        $invoice_ref = 'BUD-' . str_pad((string)$proposal_id, 4, '0', STR_PAD_LEFT);
+        
+        // FIX: Set Due Date to December 31st of the selected Fiscal Year
+        // If fiscal_year is just "2025", this results in "2025-12-31"
+        // If invalid, defaults to end of current year
+        $due_date = (is_numeric($fiscal_year)) ? $fiscal_year . '-12-31' : date('Y-12-31');
+
         $invoice_stmt = $db->prepare("
             INSERT INTO invoices 
             (invoice_number, contact_id, type, amount, status, issue_date, due_date, created_at, is_budget_allocation) 
-            VALUES (?, ?, 'Receivable', ?, 'Paid', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), 1)
+            VALUES (?, ?, 'Receivable', ?, 'Pending', NOW(), ?, NOW(), 1)
         ");
+        
         $invoice_stmt->execute([
             $invoice_ref,
             $contact_id,
-            $total_amount
-            // Removed: 'Budget Allocation: ' . $title . ' (FY: ' . $fiscal_year . ')'
+            $total_amount,
+            $due_date // Uses the calculated Fiscal Year End date
         ]);
-        $invoice_id = $db->lastInsertId();
-
-        // Create a payment record for the invoice to mark it as paid
-        $payment_id = 'BUDGET-PAY-' . date('YmdHis') . rand(100, 999);
         
-        $payment_stmt = $db->prepare("
-            INSERT INTO payments 
-            (payment_id, contact_id, invoice_id, type, amount, status, payment_date, description) 
-            VALUES (?, ?, ?, 'Receive', ?, 'Completed', NOW(), 'Budget Allocation Payment')
-        ");
-        $payment_stmt->execute([
-            $payment_id,
-            $contact_id,
-            $invoice_id,
-            $total_amount
-        ]);
+        // REMOVED: Step 4 (Payment Creation) is removed. 
+        // We want the invoice to remain "Unpaid"/Outstanding so it shows as a positive balance in AR.
 
-        // Update the budget proposal with the AR contact ID for reference
+        // 4. Update the budget proposal
         $update_proposal = $db->prepare("
             UPDATE budget_proposals 
             SET ar_contact_id = ? 
@@ -330,33 +311,29 @@ function handleDeleteProposal(PDO $db, $user_id): void {
         $contact_id = $proposal['ar_contact_id'];
         
         if ($contact_id) {
-            // Delete related payments
-            $delete_payments = $db->prepare("DELETE FROM payments WHERE contact_id = ? AND description LIKE '%Budget%'");
+            // 1. Delete ALL Payments associated with this budget contact
+            // Note: Uses 'contact_id' directly to catch everything
+            $delete_payments = $db->prepare("DELETE FROM payments WHERE contact_id = ?");
             $delete_payments->execute([$contact_id]);
             
-            // Delete related invoices
-            $delete_invoices = $db->prepare("DELETE FROM invoices WHERE contact_id = ? AND is_budget_allocation = 1");
+            // 2. Delete ALL Invoices associated with this budget contact
+            $delete_invoices = $db->prepare("DELETE FROM invoices WHERE contact_id = ?");
             $delete_invoices->execute([$contact_id]);
             
-            // Delete the budget contact if it has no other invoices
-            $check_invoices = $db->prepare("SELECT COUNT(*) as invoice_count FROM invoices WHERE contact_id = ?");
-            $check_invoices->execute([$contact_id]);
-            $invoice_count = $check_invoices->fetch()['invoice_count'];
-            
-            if ($invoice_count === 0) {
-                $delete_contact = $db->prepare("DELETE FROM business_contacts WHERE id = ? AND is_budget_contact = 1");
-                $delete_contact->execute([$contact_id]);
-            }
+            // 3. Delete the Business Contact (The Vendor/Customer Data)
+            // This ensures it is removed from the vendors_customers.php page
+            $delete_contact = $db->prepare("DELETE FROM business_contacts WHERE id = ?");
+            $delete_contact->execute([$contact_id]);
         }
         
-        // Delete the proposal
+        // 4. Delete the Proposal itself
         $delete_stmt = $db->prepare("DELETE FROM budget_proposals WHERE id = ? AND submitted_by = ?");
         $delete_stmt->execute([$proposal_id, $user_id]);
         
         // Commit transaction
         $db->commit();
         
-        $_SESSION['success_message'] = "Budget allocation deleted successfully!";
+        $_SESSION['success_message'] = "Budget allocation and associated Vendor/Customer data deleted successfully!";
         
     } catch (Exception $e) {
         // Rollback transaction on error
@@ -1279,9 +1256,7 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                                                 <button class="action-btn view" onclick="window.location.href='vendors_customers.php#customers-tab'">
                                                     <i class="fa-solid fa-eye mr-1"></i>View in AR
                                                 </button>
-                                                <button class="action-btn danger" onclick="deleteProposal(<?= $proposal['id'] ?>)">
-                                                    <i class="fa-solid fa-trash mr-1"></i>Delete
-                                                </button>
+                                                
                                             </td>
                                         </tr>
                                     <?php endforeach; ?>
