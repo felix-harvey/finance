@@ -307,7 +307,11 @@ function addNotification(string $type, string $title, string $message, string $t
 
 // Get pending disbursements data
 function getPendingDisbursements(PDO $db): array {
-    $sql = "SELECT dr.*, dr.requested_by_name, u.name AS user_name
+    $sql = "SELECT 
+                dr.*, 
+                dr.requested_by_name, 
+                u.name AS user_name,
+                dr.budget_source
             FROM disbursement_requests dr
             LEFT JOIN users u ON dr.requested_by = u.id
             WHERE dr.status = 'Pending'
@@ -1090,18 +1094,19 @@ if (isset($_SESSION['notifications'])) {
                     </div>
                     <div class="overflow-x-auto">
                         <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>Request ID</th>
-                                    <th>Description</th>
-                                    <th>Requested By</th>
-                                    <th>Department</th>
-                                    <th>Amount</th>
-                                    <th>Date Requested</th>
-                                    <th>Priority</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
+    <thead>
+        <tr>
+            <th>Request ID</th>
+            <th>Description</th>
+            
+            <th>Requested By</th>
+            <th>Department</th>
+            <th>Amount</th>
+            <th>Date Requested</th>
+            <th>Priority</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
                             <tbody>
                                 <?php if (count($pending_disbursements) > 0): ?>
                                     <?php foreach ($pending_disbursements as $request): ?>
