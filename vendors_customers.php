@@ -166,59 +166,6 @@ function formatCount($count, $show_numbers = false) {
     }
 }
 
-// UPDATED: Function to get budget-related AR contacts (department budgets)
-function getBudgetContacts(PDO $db): array {
-    $sql = "SELECT 
-                bc.*,
-                -- For budget AR contacts, net balance should be POSITIVE (allocated budget)
-                COALESCE(
-                    (SELECT SUM(i.amount) 
-                     FROM invoices i 
-                     WHERE i.contact_id = bc.id 
-                     AND i.type = 'Receivable' 
-                     AND i.status = 'Paid'), 0
-                ) as net_balance,
-                
-                -- Count of budget invoices
-                (SELECT COUNT(*) 
-                 FROM invoices i 
-                 WHERE i.contact_id = bc.id 
-                 AND i.type = 'Receivable') as invoice_count,
-                
-                -- Get latest budget proposal info
-                (SELECT GROUP_CONCAT(DISTINCT SUBSTRING(i.description, 1, 50) SEPARATOR ', ')
-                 FROM invoices i
-                 WHERE i.contact_id = bc.id 
-                 AND i.type = 'Receivable'
-                 LIMIT 3
-                ) as recent_invoices,
-                
-                -- Get total amount from invoices
-                (SELECT COALESCE(SUM(i.amount), 0) 
-                 FROM invoices i
-                 WHERE i.contact_id = bc.id 
-                 AND i.type = 'Receivable') as total_invoiced,
-                
-                -- Payment count
-                (SELECT COUNT(*) 
-                 FROM payments p
-                 WHERE p.contact_id = bc.id 
-                 AND p.type = 'Receive') as payment_count
-            FROM business_contacts bc
-            WHERE bc.status = 'Active' 
-            AND bc.type = 'Customer'
-            AND bc.contact_person = 'System Generated'
-            GROUP BY bc.id
-            ORDER BY bc.name";
-    
-    try {
-        return $db->query($sql)->fetchAll();
-    } catch (PDOException $e) {
-        error_log("Error fetching budget contacts: " . $e->getMessage());
-        return [];
-    }
-}
-
 // FIXED: Enhanced vendor data function with CORRECTED balance calculation
 function getVendors(PDO $db): array {
     $sql = "SELECT 
@@ -253,8 +200,7 @@ function getVendors(PDO $db): array {
                 GROUP BY invoice_id
             ) p ON i.id = p.invoice_id
             LEFT JOIN invoices p_inv ON bc.id = p_inv.contact_id AND p_inv.status = 'Paid'
-            WHERE bc.status = 'Active' AND bc.type = 'Customer'
-            AND bc.contact_person != 'System Generated'  // Exclude system-generated contacts
+            WHERE bc.status = 'Active' AND bc.type = 'Vendor'
             GROUP BY bc.id
             ORDER BY bc.name";
     
@@ -266,7 +212,7 @@ function getVendors(PDO $db): array {
     }
 }
 
-// FIXED: Enhanced customer data function with CORRECTED balance calculation
+// MODIFIED: Fetches ALL customers including budget allocations
 function getCustomers(PDO $db): array {
     $sql = "SELECT 
                 bc.*,
@@ -301,7 +247,7 @@ function getCustomers(PDO $db): array {
             ) p ON i.id = p.invoice_id
             LEFT JOIN invoices p_inv ON bc.id = p_inv.contact_id AND p_inv.status = 'Paid'
             WHERE bc.status = 'Active' AND bc.type = 'Customer'
-            AND bc.contact_person != 'System Generated'  // Exclude system-generated contacts
+            -- REMOVED exclusion of 'System Generated' to include Budget Allocations
             GROUP BY bc.id
             ORDER BY bc.name";
     
@@ -351,7 +297,7 @@ function getRecentBudgetApprovals(PDO $db): array {
     }
 }
 
-// Function to create budget allocation contact
+// Function to create budget allocation contact - SIMPLIFIED VERSION
 function createBudgetAllocationContact(PDO $db, string $department_name, string $proposal_title, float $amount): ?int {
     try {
         // Generate a unique contact ID for budget allocation
@@ -368,28 +314,17 @@ function createBudgetAllocationContact(PDO $db, string $department_name, string 
         $next_num = ($result['max_num'] ?? 0) + 1;
         $contact_id = $prefix . str_pad((string)$next_num, 3, '0', STR_PAD_LEFT);
         
-        // Insert the budget allocation contact
+        // Insert the budget allocation contact - using only existing columns
         $sql = "INSERT INTO business_contacts 
                 (contact_id, name, contact_person, email, phone, type, status, created_at) 
-                VALUES (?, ?, 'System Generated', 'system@company.com', 'N/A', 'Customer', 'Active', NOW())";
+                VALUES (?, ?, 'Admin', 'microfinancial25@gmail.com', '-', 'Customer', 'Active', NOW())";
         
         $stmt = $db->prepare($sql);
         $stmt->execute([$contact_id, $department_name . ' Budget']);
         
-        $contact_id = $db->lastInsertId();
+        $new_contact_id = $db->lastInsertId();
         
-        // Also create an invoice for this budget allocation
-        $invoice_sql = "INSERT INTO invoices 
-                       (contact_id, invoice_number, description, amount, type, status, issue_date, due_date, created_at)
-                       VALUES (?, ?, ?, ?, 'Receivable', 'Paid', NOW(), DATE_ADD(NOW(), INTERVAL 1 YEAR), NOW())";
-        
-        $invoice_number = 'BUDGET-' . date('Ymd') . '-' . str_pad($next_num, 3, '0', STR_PAD_LEFT);
-        $description = "Budget Allocation: " . $proposal_title;
-        
-        $invoice_stmt = $db->prepare($invoice_sql);
-        $invoice_stmt->execute([$contact_id, $invoice_number, $description, $amount]);
-        
-        return $contact_id;
+        return $new_contact_id;
         
     } catch (PDOException $e) {
         error_log("Error creating budget allocation contact: " . $e->getMessage());
@@ -467,6 +402,88 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $_SESSION['error'] = "Security validation failed";
         header("Location: vendors_customers.php");
         exit;
+    }
+
+    // ---------------------------------------------------------
+    // NEW: Handle Disbursement Request from AR
+    // ---------------------------------------------------------
+    if ($action === 'create_disbursement_request') {
+        $contact_id = $_POST['contact_id'] ?? '';
+        $contact_name = $_POST['contact_name'] ?? ''; // This is the Budget/Source Name
+        $amount = (float)($_POST['amount'] ?? 0);
+        $description = trim($_POST['description'] ?? '');
+        $department = $_POST['department'] ?? 'Finance'; 
+
+        if (empty($contact_id) || $amount <= 0 || empty($description)) {
+             $_SESSION['error'] = "Invalid disbursement details. Amount must be greater than 0.";
+             header("Location: vendors_customers.php");
+             exit;
+        }
+
+        try {
+            // [NEW] CONNECTION LOGIC: Verify Allocated Budget Balance
+            // Check if the requested amount exceeds the available budget (Net Balance of the Contact)
+            // Logic: (Total Invoices/Allocations) - (Total Payments/Usage)
+            $balance_sql = "SELECT 
+                (
+                    SELECT COALESCE(SUM(amount), 0) 
+                    FROM invoices 
+                    WHERE contact_id = ? AND type = 'Receivable'
+                ) - 
+                (
+                    SELECT COALESCE(SUM(amount), 0) 
+                    FROM payments 
+                    WHERE contact_id = ? AND type = 'Receive' AND status = 'Completed'
+                ) as current_balance";
+                
+            $balance_stmt = $db->prepare($balance_sql);
+            $balance_stmt->execute([$contact_id, $contact_id]);
+            $balance_result = $balance_stmt->fetch();
+            $current_balance = (float)($balance_result['current_balance'] ?? 0);
+
+            // [NEW] REJECT IF EXCEEDS BUDGET
+            if ($amount > $current_balance) {
+                $_SESSION['error'] = "Request Rejected: Insufficient Budget. Requested ₱" . number_format($amount, 2) . 
+                                     " but only ₱" . number_format($current_balance, 2) . " is available in " . htmlspecialchars($contact_name) . ".";
+                header("Location: vendors_customers.php");
+                exit;
+            }
+
+            // Generate Disbursement ID
+            $dateStr = date('Ymd');
+            $stmt = $db->prepare("SELECT COUNT(*) FROM disbursement_requests WHERE date_requested >= CURDATE()");
+            $stmt->execute();
+            $count = $stmt->fetchColumn() + 1;
+            $request_id = sprintf("DISB-%s-%04d", $dateStr, $count);
+
+            // [NEW] Enhanced Description to include Source
+            $final_description = $description . " [Source: " . $contact_name . "]";
+
+            // Insert into disbursement_requests table
+            $sql = "INSERT INTO disbursement_requests 
+                    (request_id, requested_by, requested_by_name, department, description, amount, status, date_requested) 
+                    VALUES (?, ?, ?, ?, ?, ?, 'Pending', NOW())";
+            
+            $stmt = $db->prepare($sql);
+            $stmt->execute([
+                $request_id, 
+                $user_id, 
+                $user['name'], 
+                $department, 
+                $final_description, 
+                $amount
+            ]);
+
+            $_SESSION['success'] = "Disbursement request sent for approval (ID: $request_id). Budget verified.";
+            header("Location: vendors_customers.php");
+            exit;
+
+        } catch (PDOException $e) {
+            error_log("Disbursement creation error: " . $e->getMessage());
+            $_SESSION['error'] = "Database error: " . $e->getMessage();
+            header("Location: vendors_customers.php");
+            exit;
+        }
     }
     
     if ($action === 'add_vendor' || $action === 'update_vendor') {
@@ -629,15 +646,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 // Get all data
 $vendors = getVendors($db);
-$customers = getCustomers($db);
-$budget_contacts = getBudgetContacts($db); // NEW: Get budget-related AR contacts
+$customers = getCustomers($db); // Now returns ALL AR contacts including budgets
 $total_budget_allocations = getTotalBudgetAllocations($db); // NEW: Total approved budgets
 $recent_budget_approvals = getRecentBudgetApprovals($db); // NEW: Recent budget approvals
 
 // FIXED: Calculate total balances with CORRECTED logic
 $total_ap_balance = 0;
 $total_ar_balance = 0;
-$total_budget_balance = 0;
+// Removed separate total_budget_balance logic
 
 foreach ($vendors as $vendor) {
     // AP: Should be NEGATIVE (you owe vendors)
@@ -646,12 +662,8 @@ foreach ($vendors as $vendor) {
 
 foreach ($customers as $customer) {
     // AR: Should be POSITIVE (customers owe you) - use absolute value for display
+    // Includes budget allocations now
     $total_ar_balance += abs((float)$customer['net_balance']);
-}
-
-foreach ($budget_contacts as $budget) {
-    // Budget AR: Should be POSITIVE (allocated budgets)
-    $total_budget_balance += abs((float)$budget['net_balance']);
 }
 
 // Get notifications
@@ -830,15 +842,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             font-size: 0.75rem;
             font-weight: 600;
             margin-left: 0.5rem;
-        }
-
-        .budget-contact-row {
-            background-color: #f0f9ff;
-            border-left: 4px solid #3b82f6;
-        }
-
-        .budget-contact-row:hover {
-            background-color: #e0f2fe;
         }
 
         /* Rest of your existing CSS styles */
@@ -1174,6 +1177,18 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             color: white;
         }
 
+        /* New Disbursement Button Style */
+        .action-btn.disburse {
+            background-color: #e0f2fe;
+            color: #0369a1;
+            border-color: #0369a1;
+        }
+        
+        .action-btn.disburse:hover {
+            background-color: #0369a1;
+            color: white;
+        }
+
         .tab-container {
             display: flex;
             border-bottom: 1px solid #e5e7eb;
@@ -1252,13 +1267,21 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             letter-spacing: 2px;
             font-family: monospace;
         }
+        
+        /* Amount error animation */
+        .amount-error {
+            animation: fadeIn 0.3s ease-in;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
     </style>
 </head>
 <body class="bg-gray-bg flex flex-col min-h-screen">
-    <!-- Overlay for mobile sidebar -->
     <div class="overlay" id="overlay"></div>
     
-    <!-- Modal for user profile -->
     <div id="profile-modal" class="modal">
         <div class="modal-content">
             <span class="close-modal">&times;</span>
@@ -1285,7 +1308,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         </div>
     </div>
     
-    <!-- Modal for Add/Edit Accounts Payable -->
     <div id="vendor-modal" class="modal">
         <div class="modal-content">
             <span class="close-modal">&times;</span>
@@ -1325,7 +1347,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         </div>
     </div>
     
-    <!-- Modal for Add/Edit Accounts Receivable -->
     <div id="customer-modal" class="modal">
         <div class="modal-content">
             <span class="close-modal">&times;</span>
@@ -1364,10 +1385,55 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             </form>
         </div>
     </div>
+
+    <div id="disburse-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-modal">&times;</span>
+            <h2 class="text-xl font-bold mb-4">Request Disbursement / Payout</h2>
+            <div class="bg-blue-50 text-blue-800 p-3 rounded mb-4 text-sm flex items-start">
+                <i class='bx bx-info-circle text-lg mr-2 mt-0.5'></i>
+                <span>This will create a request in the <strong>Pending Disbursements</strong> module for approval.</span>
+            </div>
+            <form id="disburse-form" method="POST">
+                <input type="hidden" name="action" value="create_disbursement_request">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                <input type="hidden" name="contact_id" id="disburse-contact-id">
+                
+                <div class="form-group">
+                    <label class="form-label">Payee / Account</label>
+                    <input type="text" id="disburse-contact-name" name="contact_name" class="form-input bg-gray-100" readonly>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Department (Charge To)</label>
+                    <select name="department" class="form-input" required>
+                        <option value="Finance" selected>Finance</option>
+                        <option value="Operations">Operations</option>
+                        <option value="Marketing">Marketing</option>
+                        <option value="IT">IT</option>
+                        <option value="HR">HR</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Amount</label>
+                    <input type="number" name="amount" id="disburse-amount" class="form-input" required step="0.01" min="0.01" placeholder="0.00">
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Description / Reason</label>
+                    <textarea name="description" class="form-input" rows="3" required placeholder="e.g. Budget drawdown for Q1, Payment for Invoice #123"></textarea>
+                </div>
+                
+                <div class="flex space-x-4 mt-6">
+                    <button type="button" class="btn btn-secondary flex-1 close-modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary flex-1">Submit Request</button>
+                </div>
+            </form>
+        </div>
+    </div>
     
-    <!-- Page Container -->
     <div class="flex flex-1">
-        <!-- Sidebar -->
         <div id="sidebar" class="w-64 flex flex-col fixed md:relative">
             <div class="sidebar-content">
                 <div class="p-6 bg-sidebar-green">
@@ -1383,16 +1449,13 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     <p class="text-xs text-white/90 mt-1">Microfinancial Management System 1</p>
                 </div>
                 
-                <!-- Navigation -->
                 <div class="flex-1 overflow-y-auto px-2 py-4">
                     <div class="space-y-4">
-                        <!-- Main Menu Item -->
                         <a href="dashboard8.php" class="sidebar-item py-3 px-4 rounded-lg cursor-pointer mx-2 flex items-center hover:bg-hover-state transition-colors duration-200">
                             <i class='bx bx-home text-white mr-3 text-lg'></i>
                             <span class="text-sm font-medium text-white">FINANCIAL</span>
                         </a>
                         
-                        <!-- Disbursement Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="disbursement">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Disbursement</h3>
@@ -1407,7 +1470,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                             </div>
                         </div>
 
-                        <!-- General Ledger Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="ledger">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">General Ledger</h3>
@@ -1420,7 +1482,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                             </div>
                         </div>
                         
-                        <!-- AP/AR Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="ap-ar">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">AP/AR</h3>
@@ -1434,7 +1495,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                             </div>
                         </div>
                         
-                        <!-- Collection Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="collection">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Collection</h3>
@@ -1449,7 +1509,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                             </div>
                         </div>
                         
-                        <!-- Budget Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="budget">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Budget Management</h3>
@@ -1465,16 +1524,13 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     </div>
                 </div>
                 
-                <!-- Footer inside sidebar -->
                 <div class="p-4 text-center text-xs text-white/80 border-t border-white/10 mt-auto">
                     <p>© 2025 Financial Dashboard. All rights reserved.</p>
                 </div>
             </div>
         </div>
         
-        <!-- Main Content -->
         <div id="main-content" class="flex-1 flex flex-col min-h-screen">
-            <!-- Header -->
             <div class="bg-primary-green text-white p-4 flex justify-between items-center">
                 <div class="flex items-center">
                     <button id="hamburger-btn" class="mr-4">
@@ -1488,12 +1544,10 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     </div>
                 </div>
                 <div class="flex items-center space-x-3">
-                    <!-- Number Visibility Toggle Button -->
                     <a href="?toggle_numbers=1" class="eye-toggle-btn" title="<?php echo $_SESSION['show_numbers'] ? 'Hide Numbers' : 'Show Numbers'; ?>">
                         <i class='bx <?php echo $_SESSION['show_numbers'] ? 'bx-hide' : 'bx-show'; ?> text-xl'></i>
                     </a>
                     
-                    <!-- Notification Button with Dropdown - IMPROVED -->
                     <div class="relative">
                         <button id="notification-btn" class="notification-btn" title="AP/AR Notifications">
                             <i class="fa-solid fa-bell text-xl text-white"></i>
@@ -1537,9 +1591,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                 </div>
             </div>
             
-            <!-- Main Content Area -->
             <div class="p-6 flex-1">
-                <!-- Success and Error Messages -->
                 <?php if (!empty($success_message)): ?>
                     <div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded mb-6">
                         <?php echo htmlspecialchars($success_message); ?>
@@ -1552,7 +1604,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     </div>
                 <?php endif; ?>
 
-                <!-- Search Section -->
                 <div class="bg-white rounded-xl p-6 card-shadow mb-6">
                     <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
                         <div class="flex-1">
@@ -1584,8 +1635,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     </div>
                 </div>
               
-                <!-- Summary Cards - UPDATED with Budget Allocations -->
-                <div class="grid grid-cols-1 md:grid-cols-5 gap-6 mb-6">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
                     <div class="contact-card">
                         <div class="flex items-center justify-between">
                             <div>
@@ -1633,22 +1683,8 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                             <i class='bx bx-money text-3xl opacity-80'></i>
                         </div>
                     </div>
-                    
-                    <!-- NEW: Budget Allocations Card -->
-                    <div class="contact-card" style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <p class="text-sm opacity-90">Budget Allocations</p>
-                                <p class="text-2xl font-bold <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                                    <?php echo formatNumber($total_budget_balance, $_SESSION['show_numbers']); ?>
-                                </p>
-                            </div>
-                            <i class='bx bx-wallet text-3xl opacity-80'></i>
-                        </div>
-                    </div>
                 </div>
 
-                <!-- Tabs Container - UPDATED with only two tabs -->
                 <div class="bg-white rounded-xl card-shadow">
                     <div class="tab-container">
                         <div class="tab active" data-tab="vendors">Accounts Payable</div>
@@ -1656,7 +1692,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                     </div>
 
                     <div class="p-6">
-                        <!-- Accounts Payable Tab -->
                         <div class="tab-content active" id="vendors-tab">
                             <div class="flex justify-between items-center mb-6">
                                 <h3 class="text-lg font-bold text-dark-text">Accounts Payable Management</h3>
@@ -1716,7 +1751,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                             </div>
                         </div>
 
-                        <!-- Accounts Receivable Tab with Budget Allocations INSIDE -->
                         <div class="tab-content" id="customers-tab">
                             <div class="flex justify-between items-center mb-6">
                                 <h3 class="text-lg font-bold text-dark-text">Accounts Receivable Management</h3>
@@ -1725,9 +1759,8 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                                 </button>
                             </div>
                             
-                            <!-- Regular AR Customers Table -->
                             <div class="mb-8">
-                                <h4 class="text-lg font-bold text-dark-text mb-4">Regular AR Customers</h4>
+                                
                                 <div class="overflow-x-auto">
                                     <table class="data-table">
                                         <thead>
@@ -1737,23 +1770,22 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                                                 <th>Contact Person</th>
                                                 <th>Email</th>
                                                 <th>Phone</th>
-                                                <th>Net Balance</th>
-                                                <th>Total Payments</th>
+                                                <th>Amount</th>
+                                                <th>Allocated Budget</th>
                                                 <th>Actions</th>
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            <?php 
-                                            // Filter out system-generated contacts from regular customers
-                                            $regular_customers = array_filter($customers, function($customer) {
-                                                return $customer['contact_person'] !== 'System Generated';
-                                            });
-                                            ?>
-                                            <?php if (count($regular_customers) > 0): ?>
-                                                <?php foreach ($regular_customers as $customer): ?>
+                                            <?php if (count($customers) > 0): ?>
+                                                <?php foreach ($customers as $customer): ?>
                                                 <tr>
                                                     <td class="font-mono font-medium"><?php echo htmlspecialchars($customer['contact_id']); ?></td>
-                                                    <td class="font-medium"><?php echo htmlspecialchars($customer['name']); ?></td>
+                                                    <td class="font-medium">
+                                                        <?php echo htmlspecialchars($customer['name']); ?>
+                                                        <?php if ($customer['contact_person'] === 'System Generated'): ?>
+                                                            <span class="budget-badge">Budget</span>
+                                                        <?php endif; ?>
+                                                    </td>
                                                     <td><?php echo htmlspecialchars($customer['contact_person']); ?></td>
                                                     <td><?php echo htmlspecialchars($customer['email']); ?></td>
                                                     <td><?php echo htmlspecialchars($customer['phone']); ?></td>
@@ -1769,6 +1801,9 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                                                             <button class="action-btn record" title="Record Invoice" onclick="recordInvoiceForContact(<?php echo $customer['id']; ?>, 'Customer')">
                                                                 <i class='bx bx-receipt mr-1'></i>Record
                                                             </button>
+                                                            <button class="action-btn disburse" title="Request Disbursement" onclick="openDisburseModal(<?php echo $customer['id']; ?>, '<?php echo addslashes($customer['name']); ?>', <?php echo (float)$customer['net_balance']; ?>)">
+                                                                <i class='bx bx-money mr-1'></i>Disburse
+                                                            </button>
                                                         </div>
                                                     </td>
                                                 </tr>
@@ -1776,105 +1811,13 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                                             <?php else: ?>
                                                 <tr>
                                                     <td colspan="8" class="text-center py-4 text-gray-500">
-                                                        No regular accounts receivable contacts found. <button class="text-primary-green hover:underline" onclick="openCustomerModal()">Add your first AR contact</button>
+                                                        No accounts receivable contacts found. <button class="text-primary-green hover:underline" onclick="openCustomerModal()">Add your first AR contact</button>
                                                     </td>
                                                 </tr>
                                             <?php endif; ?>
                                         </tbody>
                                     </table>
                                 </div>
-                            </div>
-                            
-                            <!-- Budget Allocations Section - MOVED HERE -->
-                            <div class="mb-8">
-                                <h4 class="text-lg font-bold text-dark-text mb-4">Budget Allocations (Department Budgets)</h4>
-                                
-                                <?php if (count($budget_contacts) > 0): ?>
-                                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-6">
-                                        <?php foreach ($budget_contacts as $budget): ?>
-                                            <div class="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl p-6 border border-blue-200">
-                                                <div class="flex items-center justify-between mb-4">
-                                                    <div>
-                                                        <h4 class="font-bold text-lg text-dark-text"><?php echo htmlspecialchars($budget['name']); ?></h4>
-                                                        <p class="text-sm text-gray-600"><?php echo htmlspecialchars($budget['contact_id']); ?></p>
-                                                    </div>
-                                                    <span class="budget-badge">Budget</span>
-                                                </div>
-                                                
-                                                <div class="mb-4">
-                                                    <p class="text-sm text-gray-600 mb-2">Total Allocated Budget:</p>
-                                                    <p class="text-2xl font-bold text-primary-green <?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                                                        <?php echo formatNumber((float)$budget['net_balance'], $_SESSION['show_numbers']); ?>
-                                                    </p>
-                                                </div>
-                                                
-                                                <?php if (!empty($budget['recent_invoices'])): ?>
-                                                    <div class="mb-4">
-                                                        <p class="text-sm font-medium text-gray-700 mb-1">Recent Budgets:</p>
-                                                        <p class="text-sm text-gray-600"><?php echo htmlspecialchars($budget['recent_invoices']); ?></p>
-                                                    </div>
-                                                <?php endif; ?>
-                                                
-                                                <div class="flex justify-between items-center">
-                                                    <div>
-                                                        <p class="text-sm text-gray-600">Payments: <span class="font-medium"><?php echo $budget['payment_count']; ?></span></p>
-                                                    </div>
-                                                    <button class="text-primary-green hover:text-primary-green/80 font-medium text-sm" onclick="viewBudgetDetails('<?php echo $budget['id']; ?>')">
-                                                        View Details →
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        <?php endforeach; ?>
-                                    </div>
-                                    
-                                    <!-- Recent Budget Approvals Table -->
-                                    <div class="mt-8">
-                                        <h4 class="text-lg font-bold text-dark-text mb-4">Recent Budget Approvals</h4>
-                                        <div class="overflow-x-auto">
-                                            <table class="data-table">
-                                                <thead>
-                                                    <tr>
-                                                        <th>Proposal Title</th>
-                                                        <th>Department</th>
-                                                        <th>Amount</th>
-                                                        <th>Approval Date</th>
-                                                        <th>Approved By</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                    <?php if (count($recent_budget_approvals) > 0): ?>
-                                                        <?php foreach ($recent_budget_approvals as $approval): ?>
-                                                            <tr>
-                                                                <td class="font-medium"><?php echo htmlspecialchars($approval['title']); ?></td>
-                                                                <td><?php echo htmlspecialchars($approval['department_name']); ?></td>
-                                                                <td class="<?php echo !$_SESSION['show_numbers'] ? 'hidden-numbers' : ''; ?>">
-                                                                    <?php echo formatNumber((float)$approval['total_amount'], $_SESSION['show_numbers']); ?>
-                                                                </td>
-                                                                <td><?php echo date('M j, Y', strtotime($approval['approval_date'])); ?></td>
-                                                                <td><?php echo htmlspecialchars($approval['approved_by'] ?? 'System'); ?></td>
-                                                            </tr>
-                                                        <?php endforeach; ?>
-                                                    <?php else: ?>
-                                                        <tr>
-                                                            <td colspan="5" class="text-center py-4 text-gray-500">
-                                                                No recent budget approvals found.
-                                                            </td>
-                                                        </tr>
-                                                    <?php endif; ?>
-                                                </tbody>
-                                            </table>
-                                        </div>
-                                    </div>
-                                <?php else: ?>
-                                    <div class="text-center py-8 border-t border-gray-200">
-                                        <i class='bx bx-wallet text-4xl text-gray-400 mb-4'></i>
-                                        <h4 class="text-lg font-medium text-gray-700 mb-2">No Budget Allocations Yet</h4>
-                                        <p class="text-gray-500 mb-6">Approved budget proposals will appear here as accounts receivable allocations.</p>
-                                        <button class="btn btn-primary" onclick="window.location.href='budget_proposal.php'">
-                                            <i class='bx bx-plus mr-2'></i>Create Budget Proposal
-                                        </button>
-                                    </div>
-                                <?php endif; ?>
                             </div>
                         </div>
                     </div>
@@ -1906,9 +1849,9 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                         <h3 class="text-lg font-bold text-dark-text mb-4">Recent Activity</h3>
                         <div class="space-y-3">
                             <?php
-                            // Get recent activity - you can enhance this with actual recent activities
+                            // Get recent activity
                             $recent_vendors = array_slice($vendors, 0, 1);
-                            $recent_customers = array_slice($regular_customers, 0, 1);
+                            $recent_customers = array_slice($customers, 0, 1);
                             $recent_budgets = array_slice($recent_budget_approvals, 0, 2);
                             ?>
                             
@@ -1946,7 +1889,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                 </div>
             </div>
             
-            <!-- Footer -->
             <footer class="main-footer mt-auto">
                 <div class="text-center">
                     <p class="text-sm">© 2025 Financial Dashboard. All rights reserved.</p>
@@ -2010,7 +1952,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             });
         });
 
-        // Tab functionality - UPDATED for only two tabs
+        // Tab functionality
         const tabs = document.querySelectorAll('.tab');
         tabs.forEach(function(tab) {
             tab.addEventListener('click', function() {
@@ -2041,6 +1983,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         const profileModal = document.getElementById('profile-modal');
         const vendorModal = document.getElementById('vendor-modal');
         const customerModal = document.getElementById('customer-modal');
+        const disburseModal = document.getElementById('disburse-modal');
         const closeButtons = document.querySelectorAll('.close-modal');
         
         if (profileBtn && profileModal) {
@@ -2051,23 +1994,19 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         
         closeButtons.forEach(function(button) {
             button.addEventListener('click', function() {
-                profileModal.style.display = 'none';
-                vendorModal.style.display = 'none';
-                customerModal.style.display = 'none';
+                if (profileModal) profileModal.style.display = 'none';
+                if (vendorModal) vendorModal.style.display = 'none';
+                if (customerModal) customerModal.style.display = 'none';
+                if (disburseModal) disburseModal.style.display = 'none';
             });
         });
         
         // Close modal when clicking outside
         window.addEventListener('click', function(event) {
-            if (event.target === profileModal) {
-                profileModal.style.display = 'none';
-            }
-            if (event.target === vendorModal) {
-                vendorModal.style.display = 'none';
-            }
-            if (event.target === customerModal) {
-                customerModal.style.display = 'none';
-            }
+            if (event.target === profileModal) profileModal.style.display = 'none';
+            if (event.target === vendorModal) vendorModal.style.display = 'none';
+            if (event.target === customerModal) customerModal.style.display = 'none';
+            if (event.target === disburseModal) disburseModal.style.display = 'none';
         });
         
         // Logout button functionality
@@ -2080,7 +2019,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             });
         }
 
-        // Notification functionality - IMPROVED
+        // Notification functionality
         const notificationBtn = document.getElementById('notification-btn');
         const notificationDropdown = document.getElementById('notification-dropdown');
         
@@ -2090,12 +2029,10 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                 notificationDropdown.classList.toggle('active');
             });
             
-            // Close notification dropdown when clicking outside
             document.addEventListener('click', function() {
                 notificationDropdown.classList.remove('active');
             });
             
-            // Prevent dropdown from closing when clicking inside it
             notificationDropdown.addEventListener('click', function(e) {
                 e.stopPropagation();
             });
@@ -2106,64 +2043,23 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         if (markAllReadBtn) {
             markAllReadBtn.addEventListener('click', function(e) {
                 e.stopPropagation();
-                
-                // Make an AJAX call to mark notifications as read
                 fetch('?mark_notifications_read=1')
                     .then(response => response.json())
                     .then(data => {
                         if (data.success) {
-                            // Update UI - remove unread styles and badge
                             const unreadItems = document.querySelectorAll('.notification-item.unread');
-                            unreadItems.forEach(item => {
-                                item.classList.remove('unread');
-                            });
-                            
-                            // Update badge count
+                            unreadItems.forEach(item => item.classList.remove('unread'));
                             const badge = document.querySelector('.notification-badge');
-                            if (badge) {
-                                badge.remove();
-                            }
-                            
-                            // Hide the mark all read button
+                            if (badge) badge.remove();
                             markAllReadBtn.style.display = 'none';
                         }
-                    })
-                    .catch(error => {
-                        console.error('Error marking notifications as read:', error);
                     });
             });
         }
 
-        // Form submission handling
-        const vendorForm = document.getElementById('vendor-form');
-        if (vendorForm) {
-            vendorForm.addEventListener('submit', function(e) {
-                const submitBtn = this.querySelector('button[type="submit"]');
-                const originalText = submitBtn.innerHTML;
-                submitBtn.innerHTML = '<div class="spinner"></div>Saving...';
-                submitBtn.disabled = true;
-            });
-        }
-
-        const customerForm = document.getElementById('customer-form');
-        if (customerForm) {
-            customerForm.addEventListener('submit', function(e) {
-                const submitBtn = this.querySelector('button[type="submit"]');
-                const originalText = submitBtn.innerHTML;
-                submitBtn.innerHTML = '<div class="spinner"></div>Saving...';
-                submitBtn.disabled = true;
-            });
-        }
-        
         // Initialize search functionality
         initializeSearch();
     });
-
-    // NEW: Function to view budget details
-    function viewBudgetDetails(contactId) {
-        // Redirect to invoices page filtered by this budget contact
-        window.location.href = 'invoices.php?contact_id=' + contactId + '&type=Receivable&budget=1';
-    }
 
     // Accounts Payable functions
     function openVendorModal(vendorId) {
@@ -2183,48 +2079,7 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             vendorIdInput.value = '';
             document.getElementById('vendor-form').reset();
         }
-        
         modal.style.display = 'block';
-    }
-
-    function editVendor(vendorId) {
-        openVendorModal(vendorId);
-    }
-
-    function deleteVendor(vendorId, vendorName) {
-        if (confirm('Are you sure you want to delete accounts payable contact "' + vendorName + '"? This action cannot be undone.')) {
-            // Create a form and submit it to delete the vendor
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.style.display = 'none';
-            
-            const actionInput = document.createElement('input');
-            actionInput.type = 'hidden';
-            actionInput.name = 'action';
-            actionInput.value = 'delete_contact';
-            form.appendChild(actionInput);
-            
-            const contactIdInput = document.createElement('input');
-            contactIdInput.type = 'hidden';
-            contactIdInput.name = 'contact_id';
-            contactIdInput.value = vendorId;
-            form.appendChild(contactIdInput);
-            
-            const contactTypeInput = document.createElement('input');
-            contactTypeInput.type = 'hidden';
-            contactTypeInput.name = 'contact_type';
-            contactTypeInput.value = 'Vendor';
-            form.appendChild(contactTypeInput);
-            
-            const csrfInput = document.createElement('input');
-            csrfInput.type = 'hidden';
-            csrfInput.name = 'csrf_token';
-            csrfInput.value = document.querySelector('input[name="csrf_token"]').value;
-            form.appendChild(csrfInput);
-            
-            document.body.appendChild(form);
-            form.submit();
-        }
     }
 
     // Accounts Receivable functions
@@ -2245,53 +2100,83 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             customerIdInput.value = '';
             document.getElementById('customer-form').reset();
         }
-        
         modal.style.display = 'block';
     }
 
-    function editCustomer(customerId) {
-        openCustomerModal(customerId);
-    }
-
-    function deleteCustomer(customerId, customerName) {
-        if (confirm('Are you sure you want to delete accounts receivable contact "' + customerName + '"? This action cannot be undone.')) {
-            // Create a form and submit it to delete the customer
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.style.display = 'none';
+    // NEW: Open Disbursement Modal with budget amount
+    function openDisburseModal(id, name, budgetAmount) {
+        const modal = document.getElementById('disburse-modal');
+        if (modal) {
+            document.getElementById('disburse-contact-id').value = id;
+            document.getElementById('disburse-contact-name').value = name;
             
-            const actionInput = document.createElement('input');
-            actionInput.type = 'hidden';
-            actionInput.name = 'action';
-            actionInput.value = 'delete_contact';
-            form.appendChild(actionInput);
+            // Update the description hint with budget information
+            const descriptionField = document.querySelector('#disburse-form textarea[name="description"]');
+            descriptionField.placeholder = `e.g. Budget drawdown for Q1, Payment for Invoice #123\nAvailable budget: ₱${budgetAmount.toLocaleString('en-PH', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
             
-            const contactIdInput = document.createElement('input');
-            contactIdInput.type = 'hidden';
-            contactIdInput.name = 'contact_id';
-            contactIdInput.value = customerId;
-            form.appendChild(contactIdInput);
+            // Set max amount to budget amount
+            const amountField = document.getElementById('disburse-amount');
+            amountField.max = budgetAmount;
+            amountField.placeholder = `Max: ₱${budgetAmount.toLocaleString('en-PH', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
             
-            const contactTypeInput = document.createElement('input');
-            contactTypeInput.type = 'hidden';
-            contactTypeInput.name = 'contact_type';
-            contactTypeInput.value = 'Customer';
-            form.appendChild(contactTypeInput);
+            // Add budget info display
+            const existingBudgetInfo = document.querySelector('.budget-info-display');
+            if (existingBudgetInfo) {
+                existingBudgetInfo.remove();
+            }
             
-            const csrfInput = document.createElement('input');
-            csrfInput.type = 'hidden';
-            csrfInput.name = 'csrf_token';
-            csrfInput.value = document.querySelector('input[name="csrf_token"]').value;
-            form.appendChild(csrfInput);
+            const budgetInfo = document.createElement('div');
+            budgetInfo.className = 'budget-info-display bg-blue-50 border border-blue-200 rounded p-3 mb-4';
+            budgetInfo.innerHTML = `
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center">
+                        <i class='bx bx-wallet text-blue-600 mr-2'></i>
+                        <span class="font-medium text-blue-800">Allocated Budget:</span>
+                    </div>
+                    <span class="font-bold text-blue-900">₱${budgetAmount.toLocaleString('en-PH', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
+                </div>
+                <div class="text-sm text-blue-600 mt-1">Maximum disbursable amount from this budget</div>
+            `;
             
-            document.body.appendChild(form);
-            form.submit();
+            // Insert after the description field hint
+            const descriptionGroup = document.querySelector('.form-group:has(textarea[name="description"])');
+            descriptionGroup.parentNode.insertBefore(budgetInfo, descriptionGroup.nextSibling);
+            
+            // Add validation for amount
+            amountField.addEventListener('input', function() {
+                const amount = parseFloat(this.value);
+                const budget = parseFloat(budgetAmount);
+                
+                if (amount > budget) {
+                    this.style.borderColor = '#ef4444';
+                    this.style.boxShadow = '0 0 0 3px rgba(239, 68, 68, 0.2)';
+                    
+                    // Show error message
+                    let errorMsg = document.querySelector('.amount-error');
+                    if (!errorMsg) {
+                        errorMsg = document.createElement('div');
+                        errorMsg.className = 'amount-error text-red-600 text-sm mt-1';
+                        this.parentNode.appendChild(errorMsg);
+                    }
+                    errorMsg.textContent = `Cannot exceed allocated budget of ₱${budget.toLocaleString('en-PH', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                } else {
+                    this.style.borderColor = '';
+                    this.style.boxShadow = '';
+                    
+                    const errorMsg = document.querySelector('.amount-error');
+                    if (errorMsg) errorMsg.remove();
+                }
+            });
+            
+            document.getElementById('disburse-form').reset();
+            document.getElementById('disburse-contact-id').value = id;
+            document.getElementById('disburse-contact-name').value = name;
+            modal.style.display = 'block';
         }
     }
 
     // Record invoice for specific contact
     function recordInvoiceForContact(contactId, contactType) {
-        // Redirect to invoices page with pre-selected contact and type
         const invoiceType = contactType === 'Vendor' ? 'Payable' : 'Receivable';
         window.location.href = 'invoices.php?contact_id=' + contactId + '&type=' + invoiceType + '&from_contact=1';
     }
@@ -2306,20 +2191,16 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         if (!searchInput || !searchResultsInfo) return;
         
         const searchTerm = searchInput.value.toLowerCase().trim();
-        
         const activeTab = document.querySelector('.tab.active')?.getAttribute('data-tab');
         if (!activeTab) return;
         
-        let tableBody;
-        
-        tableBody = document.querySelector(`#${activeTab}-tab .data-table tbody`);
+        const tableBody = document.querySelector(`#${activeTab}-tab .data-table tbody`);
         if (!tableBody) return;
         
         const rows = tableBody.querySelectorAll('tr');
         let visibleRows = 0;
         
         rows.forEach(row => {
-            // Skip empty state rows
             if (row.cells.length <= 1) return;
             
             const cells = row.cells;
@@ -2330,14 +2211,12 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             const balanceCell = cells[5];
             const balanceText = balanceCell.textContent;
             
-            // Text search
             const matchesSearch = !searchTerm || 
                                  contactId.includes(searchTerm) || 
                                  companyName.includes(searchTerm) || 
                                  contactPerson.includes(searchTerm) || 
                                  email.includes(searchTerm);
             
-            // Balance filter
             let matchesBalance = true;
             if (selectedBalance) {
                 const balanceValue = parseFloat(balanceText.replace(/[^\d.-]/g, ''));
@@ -2348,32 +2227,14 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             
             const isVisible = matchesSearch && matchesBalance;
             row.style.display = isVisible ? '' : 'none';
-            
-            if (isVisible) {
-                visibleRows++;
-            }
+            if (isVisible) visibleRows++;
         });
         
-        // Update results info
         if (searchTerm || selectedBalance) {
             searchResultsInfo.classList.remove('hidden');
             resultsCount.textContent = visibleRows;
         } else {
             searchResultsInfo.classList.add('hidden');
-        }
-        
-        // Show/hide empty state
-        const emptyStateRow = tableBody.querySelector('tr td[colspan]');
-        if (emptyStateRow) {
-            const parentRow = emptyStateRow.closest('tr');
-            if (visibleRows === 0 && !searchTerm && !selectedBalance) {
-                parentRow.style.display = '';
-            } else if (visibleRows === 0) {
-                parentRow.style.display = '';
-                emptyStateRow.textContent = 'No contacts found matching your search criteria.';
-            } else {
-                parentRow.style.display = 'none';
-            }
         }
     }
 
@@ -2381,16 +2242,11 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
         const searchInput = document.getElementById('search-contacts');
         const clearSearchBtn = document.getElementById('clear-search');
         const filterBalance = document.getElementById('filter-balance');
-        const searchResultsInfo = document.getElementById('search-results-info');
-        const resultsCount = document.getElementById('results-count');
         
         if (!searchInput) return;
         
-        // Event listeners
         searchInput.addEventListener('input', performSearch);
-        if (filterBalance) {
-            filterBalance.addEventListener('change', performSearch);
-        }
+        if (filterBalance) filterBalance.addEventListener('change', performSearch);
         
         if (clearSearchBtn) {
             clearSearchBtn.addEventListener('click', function() {
@@ -2401,15 +2257,6 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             });
         }
         
-        // Add keyboard shortcut
-        searchInput.addEventListener('keydown', function(e) {
-            if (e.ctrlKey && e.key === 'k') {
-                e.preventDefault();
-                this.focus();
-            }
-        });
-        
-        // Add global keyboard shortcut
         document.addEventListener('keydown', function(e) {
             if (e.ctrlKey && e.key === 'k') {
                 e.preventDefault();
@@ -2417,10 +2264,8 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
             }
         });
         
-        // Initial search to set up the state
         performSearch();
     }
-      
     </script>
 </body>
 </html>
