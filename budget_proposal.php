@@ -154,7 +154,6 @@ function handleCreateProposal(PDO $db, $user_id): void {
     $department = (int)$_POST['department'];
     $fiscal_year = trim($_POST['fiscal_year']);
     $total_amount = (float)$_POST['total_amount'];
-    $description = trim($_POST['description'] ?? '');
     
     if (empty($title)) {
         throw new Exception("Proposal title is required");
@@ -171,10 +170,10 @@ function handleCreateProposal(PDO $db, $user_id): void {
         // Insert budget proposal with status 'Approved' (auto-allocated)
         $stmt = $db->prepare("
             INSERT INTO budget_proposals 
-            (title, department, fiscal_year, submitted_by, status, description, total_amount) 
-            VALUES (?, ?, ?, ?, 'Approved', ?, ?)
+            (title, department, fiscal_year, submitted_by, status, total_amount) 
+            VALUES (?, ?, ?, ?, 'Approved', ?)
         ");
-        $stmt->execute([$title, $department, $fiscal_year, $user_id, $description, $total_amount]);
+        $stmt->execute([$title, $department, $fiscal_year, $user_id, $total_amount]);
         $proposal_id = $db->lastInsertId();
         
         // Find or create a customer/AR contact for the department
@@ -237,14 +236,14 @@ function handleCreateProposal(PDO $db, $user_id): void {
         $invoice_ref = 'BUDGET-' . str_pad($proposal_id, 4, '0', STR_PAD_LEFT);
         $invoice_stmt = $db->prepare("
             INSERT INTO invoices 
-            (invoice_number, contact_id, type, amount, description, status, issue_date, due_date, created_at, is_budget_allocation) 
-            VALUES (?, ?, 'Receivable', ?, ?, 'Paid', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), 1)
+            (invoice_number, contact_id, type, amount, status, issue_date, due_date, created_at, is_budget_allocation) 
+            VALUES (?, ?, 'Receivable', ?, 'Paid', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), NOW(), 1)
         ");
         $invoice_stmt->execute([
             $invoice_ref,
             $contact_id,
-            $total_amount,
-            'Budget Allocation: ' . $title . ' (FY: ' . $fiscal_year . ')'
+            $total_amount
+            // Removed: 'Budget Allocation: ' . $title . ' (FY: ' . $fiscal_year . ')'
         ]);
         $invoice_id = $db->lastInsertId();
 
@@ -294,14 +293,14 @@ function handleUpdateProposal(PDO $db, $user_id): void {
     
     $proposal_id = (int)$_POST['proposal_id'];
     $title = trim($_POST['title']);
-    $description = trim($_POST['description'] ?? '');
     
     $stmt = $db->prepare("
         UPDATE budget_proposals 
-        SET title = ?, description = ?, updated_at = NOW()
+        SET title = ?, updated_at = NOW()
         WHERE id = ? AND submitted_by = ?
     ");
-    $stmt->execute([$title, $description, $proposal_id, $user_id]);
+    
+    $stmt->execute([$title, $proposal_id, $user_id]);
     
     $_SESSION['success_message'] = "Budget allocation updated successfully!";
     header("Location: budget_proposal.php");
@@ -372,6 +371,9 @@ function handleDeleteProposal(PDO $db, $user_id): void {
 function loadData(PDO $db, $user_id, &$budget_proposals, &$departments, &$fiscal_years, &$categories): void {
     try {
         // Get budget proposals - show all approved (allocated) budgets
+        // Removed description from field selection if it doesn't exist to be safe, though select * is used
+        // Assuming SELECT bp.* is safe if description column doesn't exist, it just won't be returned.
+        // But the previous code had a specific fetch for it? No, it used bp.*
         $proposal_stmt = $db->prepare("
             SELECT bp.*, u.name as submitter_name, 
                    d.name as department_name,
@@ -383,7 +385,7 @@ function loadData(PDO $db, $user_id, &$budget_proposals, &$departments, &$fiscal
             LEFT JOIN departments d ON bp.department = d.id
             LEFT JOIN business_contacts bc ON bp.ar_contact_id = bc.id
             WHERE bp.submitted_by = ?
-            AND bp.status = 'Approved'  -- Show approved budgets (allocated)
+            AND bp.status = 'Approved'
             GROUP BY bp.id
             ORDER BY bp.created_at DESC
         ");
@@ -498,9 +500,9 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
             border-radius: 9999px;
         }
         .status-approved {
-    background-color: rgba(34, 197, 94, 0.1);
-    color: #16A34A;
-}
+            background-color: rgba(34, 197, 94, 0.1);
+            color: #16A34A;
+        }
         #sidebar {
             transition: transform 0.3s ease-in-out;
             background-color: #2f855A;
@@ -951,10 +953,8 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
     </style>
 </head>
 <body class="bg-gray-bg">
-    <!-- Overlay for mobile sidebar -->
     <div class="overlay" id="overlay"></div>
     
-    <!-- Modal for user profile -->
     <div id="profile-modal" class="modal">
         <div class="modal-content">
             <span class="close-modal">&times;</span>
@@ -981,7 +981,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
         </div>
     </div>
 
-    <!-- Modal for notifications -->
     <div id="notification-modal" class="modal">
         <div class="modal-content">
             <span class="close-modal">&times;</span>
@@ -992,7 +991,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
         </div>
     </div>
 
-    <!-- Modal for creating new budget proposal -->
     <div id="create-proposal-modal" class="modal">
         <div class="modal-content">
             <span class="close-modal">&times;</span>
@@ -1029,12 +1027,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                            placeholder="0.00">
                     <p class="text-sm text-gray-500 mt-1">This amount will be automatically allocated to Accounts Receivable</p>
                 </div>
-                <div class="form-group">
-                    <label class="form-label">Description</label>
-                    <textarea name="description" class="form-textarea" rows="3" 
-                              placeholder="Enter detailed budget description (optional)"></textarea>
-                </div>
-                
                 <div class="flex space-x-2 mt-6">
                     <button type="button" class="btn btn-secondary flex-1" onclick="closeModal('create-proposal-modal')">Cancel</button>
                     <button type="submit" name="create_proposal" class="btn btn-primary flex-1">Allocate Budget</button>
@@ -1043,19 +1035,15 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
         </div>
     </div>
 
-    <!-- Edit Proposal Modal -->
     <div id="edit-proposal-modal" class="edit-modal">
         <div class="edit-modal-content">
             <span class="close-modal">&times;</span>
             <div id="edit-modal-content">
-                <!-- Content will be loaded dynamically via JavaScript -->
-            </div>
+                </div>
         </div>
     </div>
 
-    <!-- Page Container -->
     <div class="page-container">
-        <!-- Sidebar -->
         <div id="sidebar" class="w-64 flex flex-col fixed md:relative">
             <div class="sidebar-content">
                 <div class="p-6 bg-sidebar-green">
@@ -1071,16 +1059,13 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                     <p class="text-xs text-white/90 mt-1">Microfinancial Management System</p>
                 </div>
                 
-                <!-- Navigation -->
                 <div class="flex-1 overflow-y-auto px-2 py-4">
                     <div class="space-y-4">
-                        <!-- Main Menu Item -->
                         <a href="dashboard8.php" class="sidebar-item py-3 px-4 rounded-lg cursor-pointer mx-2 flex items-center hover:bg-hover-state transition-colors duration-200">
                             <i class='bx bx-home text-white mr-3 text-lg'></i>
                             <span class="text-sm font-medium text-white">FINANCIAL</span>
                         </a>
                      
-                        <!-- Disbursement Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="disbursement">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Disbursement</h3>
@@ -1095,7 +1080,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                             </div>
                         </div>
                         
-                        <!-- General Ledger Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="ledger">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">General Ledger</h3>
@@ -1108,7 +1092,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                             </div>
                         </div>
                         
-                        <!-- AP/AR Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="ap-ar">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">AP/AR</h3>
@@ -1122,7 +1105,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                             </div>
                         </div>
                    
-                        <!-- Collection Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="collection">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Collection</h3>
@@ -1137,7 +1119,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                             </div>
                         </div>
 
-                        <!-- Budget Section -->
                         <div class="py-1 mx-2">
                             <div class="flex items-center justify-between sidebar-category py-3 px-3 rounded cursor-pointer hover:bg-hover-state transition-colors duration-200" data-category="budget">
                                 <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Budget Management</h3>
@@ -1152,16 +1133,13 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                     </div>
                 </div>
                 
-                <!-- Footer inside sidebar -->
                 <div class="p-4 text-center text-xs text-white/80 border-t border-white/10 mt-auto">
                     <p>© 2025 Financial Dashboard. All rights reserved.</p>
                 </div>
             </div>
         </div>
         
-        <!-- Main Content -->
         <div id="main-content" class="flex-1 overflow-y-auto flex flex-col">
-            <!-- Header -->
             <div class="bg-primary-green text-white p-4 flex justify-between items-center">
                 <div class="flex items-center">
                     <button id="hamburger-btn" class="mr-4">
@@ -1175,7 +1153,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                     </div>
                 </div>
                 <div class="flex items-center space-x-3">
-                    <!-- Number Visibility Toggle Button -->
                     <form method="POST" id="hide-numbers-form" class="inline">
                         <input type="hidden" name="toggle_hide_numbers" value="1">
                         <button type="submit" class="eye-toggle-btn" title="<?php echo $_SESSION['hide_numbers'] ? 'Show Numbers' : 'Hide Numbers'; ?>">
@@ -1196,7 +1173,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
             </div>
             
             <div class="p-6 flex-1">
-                <!-- Success/Error Messages -->
                 <?php if (isset($_SESSION['success_message'])): ?>
                     <div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded mb-4">
                         <?= safe_output($_SESSION['success_message']) ?>
@@ -1211,7 +1187,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                     </div>
                 <?php endif; ?>
 
-                <!-- Quick Stats -->
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                     <div class="stat-card">
                         <div class="stat-value text-primary-green"><?= count($budget_proposals) ?></div>
@@ -1236,7 +1211,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                     </div>
                 </div>
 
-                <!-- Action Buttons -->
                 <div class="flex justify-between items-center mb-6">
                     <h2 class="text-xl font-bold">Budget Allocations</h2>
                     <div class="flex space-x-2">
@@ -1252,7 +1226,6 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                     </div>
                 </div>
 
-                <!-- Proposals Table -->
                 <div class="metric-card">
                     <div class="overflow-x-auto">
                         <table class="data-table">
@@ -1280,16 +1253,13 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                                         <tr class="budget-item-row">
                                             <td>
                                                 <div class="font-semibold"><?= safe_output($proposal['title'] ?? 'Untitled Budget') ?></div>
-                                                <?php if (!empty($proposal['description'])): ?>
-                                                    <div class="text-sm text-gray-500"><?= safe_output(substr($proposal['description'], 0, 50)) . (strlen($proposal['description']) > 50 ? '...' : '') ?></div>
-                                                <?php endif; ?>
-                                            </td>
+                                                </td>
                                             <td><?= safe_output($proposal['department_name'] ?? $proposal['department']) ?></td>
                                             <td><?= safe_output($proposal['fiscal_year']) ?></td>
                                             <td>
                                                 <span class="status-badge status-approved">
-    Allocated
-</span>
+                                                    Allocated
+                                                </span>
                                             </td>
                                             <td class="font-semibold <?= $_SESSION['hide_numbers'] ? 'amount-masked' : '' ?>">
                                                 <?php 
@@ -1320,30 +1290,8 @@ $unread_notifications = array_filter($notifications, fn($n) => empty($n['is_read
                         </table>
                     </div>
                 </div>
-                
-                <!-- Information Box -->
-                <div class="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
-                    <div class="flex items-start">
-                        <div class="flex-shrink-0">
-                            <i class="fa-solid fa-info-circle text-blue-500 text-xl"></i>
-                        </div>
-                        <div class="ml-3">
-                            <h3 class="text-sm font-medium text-blue-800">How Budget Allocations Work</h3>
-                            <div class="mt-2 text-sm text-blue-700">
-                                <ul class="list-disc pl-5 space-y-1">
-                                    <li>When you create a budget allocation, it's automatically recorded in Accounts Receivable</li>
-                                    <li>Each department gets its own budget account in the AR system</li>
-                                    <li>Budget amounts appear in the "Budget Allocations" tab of Payable/Receivable</li>
-                                    <li>No approval or rejection is needed - allocations are immediate</li>
-                                    <li>To view budget allocations in AR, click "View in AR" or go to Payable/Receivable → Budget Allocations tab</li>
-                                </ul>
-                            </div>
-                        </div>
-                    </div>
-                </div>
             </div>
             
-            <!-- Footer -->
             <footer class="main-footer">
                 <div class="text-center">
                     <p class="text-sm">© 2025 Financial Dashboard. All rights reserved.</p>
