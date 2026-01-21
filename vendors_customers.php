@@ -1407,8 +1407,8 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                 <div class="form-group">
                     <label class="form-label">Department (Charge To)</label>
                     <select name="department" class="form-input" required>
-                        <option value="Finance" selected>Finance</option>
-                        <option value="Operations">Operations</option>
+                        <option value="Core" selected>Core</option>
+                        <option value="Payroll">Payroll</option>
                         <option value="Marketing">Marketing</option>
                         <option value="IT">IT</option>
                         <option value="HR">HR</option>
@@ -1770,8 +1770,8 @@ if (isset($_GET['budget_approved']) && isset($_GET['proposal_title']) && isset($
                                                 <th>Contact Person</th>
                                                 <th>Email</th>
                                                 <th>Phone</th>
-                                                <th>Amount</th>
                                                 <th>Allocated Budget</th>
+                                                <th>Amount</th>
                                                 <th>Actions</th>
                                             </tr>
                                         </thead>
